@@ -10,10 +10,14 @@
 //!
 //! BEGINNER NOTES
 //! --------------
-//! SQLite is a C library. To call it from Zig we use `@cImport`, which
-//! runs the Zig "translate-c" tool over a C header and produces a Zig
-//! module containing all the declarations. After this block, every
-//! `c.sqlite3_*` function is just an `extern "c" fn` underneath.
+//! SQLite is a C library. To call it from Zig we run the "translate-c"
+//! tool over a thin shim header (`src/sqlite_c.h`) and import the result
+//! as a regular Zig module. After this import, every `c.sqlite3_*`
+//! function is just an `extern "c" fn` underneath.
+//!
+//! Why an import and not `@cImport`? Zig 0.16 deprecated source-level
+//! `@cImport` in favor of running translate-c through the build system.
+//! The wiring lives in `build.zig` (`b.addTranslateC` + `addImport`).
 //!
 //! SQLite's "prepared statement" lifecycle is:
 //!     prepare → bind args → step (until SQLITE_DONE or row) → finalize
@@ -22,12 +26,10 @@
 
 const std = @import("std");
 
-// `@cImport({...})` runs at compile time. The block inside is a comptime
-// scope where you call `@cInclude("header.h")` once per header you want.
-// The resulting module is bound to whatever name you choose — `c` here.
-pub const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+// `@import("sqlite_c")` pulls in the translate-c output that build.zig
+// wired up under that name. The module exposes every `sqlite3_*` symbol
+// and every `SQLITE_*` constant from sqlite3.h.
+pub const c = @import("sqlite_c");
 
 // SQLITE_TRANSIENT (((destructor_type)-1)) and SQLITE_STATIC (0) are
 // sentinel "function pointers" defined as macros in the SQLite header.
