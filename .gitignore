@@ -1,0 +1,9 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# macOS
+.DS_Store
+
+# Claude Code per-user settings (commit .claude/settings.json manually if you want it shared)
+.claude/settings.local.json
