@@ -215,7 +215,7 @@ extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 ///
 /// `0o755` is an octal literal — the standard "rwxr-xr-x" file mode.
 fn mkdirP(allocator: std.mem.Allocator, path: []const u8) !void {
-    const z = try allocator.dupeZ(u8, path);
+    const z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(z);
     if (mkdir(z.ptr, 0o755) == 0) return;
 

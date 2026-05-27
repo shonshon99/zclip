@@ -126,10 +126,10 @@ pub const Db = struct {
         // can be cast to many things. Used here because that's exactly
         // what sqlite3_exec wants as out-param for the error message.
         //
-        // dupeZ makes a 0-terminated copy. We could also just pass
+        // dupeSentinel makes a 0-terminated copy. We could also just pass
         // `sql.ptr` if we knew the caller always provided a sentinel
         // slice — but the API takes plain `[]const u8` for convenience.
-        const z = self.allocator.dupeZ(u8, sql) catch return Error.OutOfMemory;
+        const z = self.allocator.dupeSentinel(u8, sql, 0) catch return Error.OutOfMemory;
         defer self.allocator.free(z);
         const rc = c.sqlite3_exec(self.handle, z.ptr, null, null, &err);
         if (rc != c.SQLITE_OK) {

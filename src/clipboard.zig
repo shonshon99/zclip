@@ -138,11 +138,11 @@ fn nsStringFromCStr(s: [*:0]const u8) Id {
     return msg(SendIdCstr_Id)(NSString, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// Same but takes a Zig slice. `dupeZ` makes a 0-terminated copy because
-// the C function needs a null terminator. We free our copy right away;
-// the NSString has already copied the bytes internally.
+// Same but takes a Zig slice. `dupeSentinel` makes a 0-terminated copy
+// because the C function needs a null terminator. We free our copy right
+// away; the NSString has already copied the bytes internally.
 fn nsStringFromSlice(allocator: std.mem.Allocator, s: []const u8) !Id {
-    const z = try allocator.dupeZ(u8, s);
+    const z = try allocator.dupeSentinel(u8, s, 0);
     defer allocator.free(z);
     return nsStringFromCStr(z.ptr);
 }
