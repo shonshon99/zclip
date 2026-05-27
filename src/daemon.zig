@@ -34,13 +34,15 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
 extern "c" fn ftruncate(fd: c_int, length: c_long) c_int;
 extern "c" fn pwrite(fd: c_int, buf: [*]const u8, n: usize, offset: c_long) isize;
+extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
 
-// Flag constants from macOS's <fcntl.h> and <sys/file.h>. Hardcoded
-// rather than `@cImport`ed for the four values we actually need.
+// Flag constants from macOS's <fcntl.h>, <sys/file.h>, <unistd.h>.
+// Hardcoded rather than `@cImport`ed for the handful of values we use.
 const O_WRONLY: c_int = 0x0001;
 const O_CREAT: c_int = 0x0200; // value is darwin-specific (Linux uses 0x40)
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
+const F_OK: c_int = 0; // access() mode: test existence only
 
 // `extern struct` means "lay this out exactly the way C would, no field
 // reordering or padding optimisations". Required when passing structs by
@@ -119,15 +121,27 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
     installSignalHandlers();
 
     // ---- Build paths under ~/.local/share/zclip ----
-    const home_cstr = std.c.getenv("HOME") orelse return error.MissingHome;
-    const home = std.mem.span(home_cstr);
-    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.local/share/zclip", .{home});
-    defer allocator.free(dir_path);
-    try mkdirP(allocator, dir_path);
-
+    //
     // `allocPrintSentinel(..., 0)` allocates a formatted string AND
     // appends a 0 byte so the result is also valid as a C string.
-    // Required because flock's path and SQLite's path both go to C.
+    // Required because access(), flock's path, and SQLite's path all go
+    // to C.
+    const home_cstr = std.c.getenv("HOME") orelse return error.MissingHome;
+    const home = std.mem.span(home_cstr);
+    const dir_path = try std.fmt.allocPrintSentinel(allocator, "{s}/.local/share/zclip", .{home}, 0);
+    defer allocator.free(dir_path);
+
+    // `access(path, F_OK)` returns 0 iff the path exists and is reachable.
+    // We deliberately do NOT create the directory — the user must set it
+    // up themselves. Print an actionable hint before bailing so the user
+    // knows exactly which command to run.
+    if (access(dir_path.ptr, F_OK) != 0) {
+        try log_w.print("zclip daemon: storage directory missing: {s}\n", .{dir_path});
+        try log_w.print("  create it with: mkdir -p {s}\n", .{dir_path});
+        try log_w.flush();
+        return error.MissingStorageDir;
+    }
+
     const pid_path = try std.fmt.allocPrintSentinel(allocator, "{s}/zclip.pid", .{dir_path}, 0);
     defer allocator.free(pid_path);
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/history.db", .{dir_path}, 0);
@@ -206,36 +220,6 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
 
     try log_w.writeAll("zclip daemon: shutting down\n");
     try log_w.flush();
-}
-
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
-
-/// Recursive mkdir -p via libc. Walks up the path until it finds an
-/// existing parent, then walks back down creating directories.
-///
-/// `0o755` is an octal literal — the standard "rwxr-xr-x" file mode.
-fn mkdirP(allocator: std.mem.Allocator, path: []const u8) !void {
-    const z = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(z);
-    if (mkdir(z.ptr, 0o755) == 0) return;
-
-    // `std.c._errno().*` reads the `errno` thread-local. `_errno()` is a
-    // function returning a `*c_int`; `.*` dereferences it (like C's
-    // `*errno_ptr`).
-    const e = std.c._errno().*;
-
-    // EEXIST = 17 on darwin: directory already there, treat as success.
-    if (e == 17) return;
-    // ENOENT = 2: parent missing — recurse on the parent path.
-    if (e == 2) {
-        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.CannotCreateDir;
-        if (slash == 0) return error.CannotCreateDir;
-        try mkdirP(allocator, path[0..slash]);
-        if (mkdir(z.ptr, 0o755) == 0) return;
-        if (std.c._errno().* == 17) return;
-        return error.CannotCreateDir;
-    }
-    return error.CannotCreateDir;
 }
 
 /// Open the pidfile and grab an exclusive non-blocking flock. Returns
