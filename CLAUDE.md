@@ -22,27 +22,23 @@ DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/
 ```
 src/main.zig       CLI router, search/use commands, ISO timestamp formatting
 src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
-src/db.zig         SQLite wrapper (@cImport sqlite3.h)
-src/daemon.zig     Poll loop, pidfile flock, signal handlers, mkdir -p
-build.zig          Links sqlite3, AppKit, Foundation; link_libc
+src/db.zig         SQLite wrapper (translate-c on src/sqlite_c.h)
+src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
+src/sqlite_c.h     Shim header — `#include <sqlite3.h>` for build-system translate-c
+build.zig          translate-c sqlite3, link AppKit/Foundation; link_libc
 build.zig.zon      minimum_zig_version = "0.16.0"
 .zigversion        0.16.0
 ```
 
 ## Zig version
 
-Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. Originally aimed at 0.15.2 but 0.16 introduced incompatible APIs (`pub fn main(init: std.process.Init)`, `std.Io.File.Writer`). If you bump or downgrade Zig, expect rework in `main.zig` first.
+Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. The codebase uses 0.16-idiomatic APIs throughout: `pub fn main(init: std.process.Init)`, `std.Io.File.Writer`, `std.Io.Dir.createFile` with advisory lock options, `std.Io.sleep`, `std.Io.Timestamp.now`, `init.minimal.environ.getPosix`. If you bump or downgrade Zig, expect rework in `main.zig` and `daemon.zig` first.
 
 ## Critical gotchas
 
-**0.16 Io refactor stripped most syscalls from std.** These were removed and replaced via libc extern fns:
-- `std.posix.open`, `std.posix.flock`, `std.posix.ftruncate`, `std.posix.pwrite`, `std.posix.close`, `std.posix.getenv`
-- `std.fs.cwd`, `std.fs.makeDirAbsolute`, `Dir.makePath`
-- `std.Thread.sleep`
-- `std.time.timestamp`
-- `std.posix.sigaction` (Darwin variant has typed-enum handler signature; use libc `signal()` instead)
+**Signal handling stays on libc.** `daemon.zig` declares `extern "c" fn signal` and uses raw `SIGINT`/`SIGTERM` constants because `std.posix.sigaction` on Darwin requires a typed-enum handler signature that's awkward to satisfy, and 0.16's Io interface doesn't expose signal handlers. Don't try to "modernize" this without checking the Darwin sigaction prototype first.
 
-When adding code, prefer libc extern fn over searching std for the equivalent. The std API is mid-flux.
+**SQLite C bindings via build-system translate-c, not `@cImport`.** `build.zig` runs `b.addTranslateC` on `src/sqlite_c.h` and exposes the result as `@import("sqlite_c")`. `@cImport` in source files is deprecated in 0.16. Add new SQLite symbols by editing the shim header, not by re-introducing `@cImport`.
 
 **SQLite destructor sentinels.** `c.SQLITE_TRANSIENT` and `c.SQLITE_STATIC` are macro-expanded as `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits these as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check at comptime. Workaround in `db.zig`: declare `const SQLITE_STATIC: c.sqlite3_destructor_type = null` and pass null. Safe because all bound buffers outlive `sqlite3_finalize` in our usage.
 
@@ -54,7 +50,7 @@ When adding code, prefer libc extern fn over searching std for the equivalent. T
 
 **Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext.
 
-**WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance via `flock(LOCK_EX | LOCK_NB)` on the pidfile — `EWOULDBLOCK` (errno 35 on Darwin) maps to `error.AlreadyRunning`.
+**WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
 
 ## Schema
 
