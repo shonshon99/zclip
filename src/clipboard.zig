@@ -34,10 +34,13 @@
 //!         identical machine code to what we wrote by hand, no per-site
 //!         scaffolding.
 //!
-//! On ARM64 there's one msgSend variant. On x86_64 the lib also picks
-//! `objc_msgSend_stret` / `_fpret` when needed — our hand-rolled code
-//! ignored that, which would have bitten us if we ever returned a large
-//! struct by value.
+//! On ARM64 there's only one msgSend entry point — large struct returns
+//! use the standard sret-arg ABI, so `objc_msgSend` handles them. On
+//! x86_64 the runtime exposes separate `objc_msgSend_stret` (struct
+//! return) and `objc_msgSend_fpret` (x87 floating-point return) symbols;
+//! zig-objc picks the right one based on the Return type. Our hand-rolled
+//! code always called plain `objc_msgSend`, which would have miscompiled
+//! struct-return selectors on x86_64.
 
 const std = @import("std");
 const objc = @import("objc");
