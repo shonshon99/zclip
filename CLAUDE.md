@@ -46,7 +46,9 @@ When adding code, prefer libc extern fn over searching std for the equivalent. T
 
 **SQLite destructor sentinels.** `c.SQLITE_TRANSIENT` and `c.SQLITE_STATIC` are macro-expanded as `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits these as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check at comptime. Workaround in `db.zig`: declare `const SQLITE_STATIC: c.sqlite3_destructor_type = null` and pass null. Safe because all bound buffers outlive `sqlite3_finalize` in our usage.
 
-**NSPasteboard FFI is hand-rolled.** `@cImport(<objc/runtime.h>)` is fragile through translate-c. `clipboard.zig` declares `objc_getClass`, `sel_registerName`, `objc_msgSend` directly as extern fns and casts `objc_msgSend` per call site with `msg(SendIdToId)` helpers. Add new selectors by extending the `Send*` typedefs.
+**NSPasteboard goes through `mitchellh/zig-objc`.** `clipboard.zig` calls `objc.getClass("...")` and `obj.msgSend(Return, "selector:", .{args})`. The lib synthesizes the `objc_msgSend` cast per call site from the Return type + args tuple — no per-selector boilerplate needed. Earlier revisions hand-rolled the FFI (extern `objc_msgSend` + `Send*` fn-pointer typedefs + a `msg(comptime T)` ptrCast helper); git history has the reference if you ever need to inline it again.
+
+**Daemon poll loop wraps each tick in an `objc.AutoreleasePool`.** Methods like `[NSString stringWithUTF8String:]`, `[pb types]`, and `[pb stringForType:]` return autoreleased Obj-C objects. With no pool on the thread they accumulate in a process-global pool that never drains. Pool push/pop per iteration bounds growth. `readString` copies bytes into the caller's allocator *before* the pool drains — don't pass any raw NSString-owned pointer past the `defer pool.deinit()`.
 
 **Origin marker prevents daemon feedback loop.** `zclip use` writes content tagged with custom type `dev.zclip.origin`. Daemon's poll checks `pb.hasOrigin()` and skips. Don't strip this from `writeStringAsOrigin`.
 
