@@ -205,11 +205,14 @@ pub const Pasteboard = struct {
     ///     return NO;
     pub fn hasType(self: Pasteboard, wanted: [*:0]const u8) bool {
         const wanted_ns = nsStringFromCStr(wanted);
+
         // `[self.pb types]` — get the NSArray of type identifiers.
         const types = msg(SendIdToId)(self.pb, sel_registerName("types"));
         if (types == null) return false;
+
         // `[types count]` — length of the array.
         const count = msg(SendIdToLong)(types, sel_registerName("count"));
+
         var i: c_long = 0;
         while (i < count) : (i += 1) {
             // One-off call shape: takes a c_long arg, returns an object.
@@ -218,11 +221,13 @@ pub const Pasteboard = struct {
                 *const fn (Id, Sel, c_long) callconv(.c) Id,
                 @ptrCast(&objc_msgSend),
             )(types, sel_registerName("objectAtIndex:"), i);
+
             // [item isEqualToString:wanted_ns] → bool.
             const eq = @as(
                 *const fn (Id, Sel, Id) callconv(.c) bool,
                 @ptrCast(&objc_msgSend),
             )(item, sel_registerName("isEqualToString:"), wanted_ns);
+
             if (eq) return true;
         }
         return false;
