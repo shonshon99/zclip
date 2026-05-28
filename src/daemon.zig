@@ -144,8 +144,6 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
 
     const pid_path = try std.fmt.allocPrintSentinel(allocator, "{s}/zclip.pid", .{dir_path}, 0);
     defer allocator.free(pid_path);
-    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/history.db", .{dir_path}, 0);
-    defer allocator.free(db_path);
 
     // ---- Acquire the single-instance lock ----
     //
@@ -168,6 +166,9 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
     try writePid(pid_fd);
 
     // ---- Open the database ----
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/history.db", .{dir_path}, 0);
+    defer allocator.free(db_path);
+
     var db = try db_mod.Db.open(allocator, db_path);
     defer db.close();
 
