@@ -1,54 +1,30 @@
-//! Thin SQLite wrapper for zclip.
+//! SQLite wrapper.
 //!
 //! Schema:
 //!   entries(id INTEGER PK, content TEXT, hash BLOB, copied_at INTEGER)
 //!   index on hash, index on copied_at
 //!
 //! `upsertByHash` updates `copied_at` if the same content has been seen
-//! before (matched by SHA256), otherwise inserts. This keeps recency
-//! accurate without exploding storage on repeat copies.
+//! before (matched by SHA256), otherwise inserts.
 //!
-//! BEGINNER NOTES
-//! --------------
-//! SQLite is a C library. To call it from Zig we run the "translate-c"
-//! tool over a thin shim header (`src/sqlite_c.h`) and import the result
-//! as a regular Zig module. After this import, every `c.sqlite3_*`
-//! function is just an `extern "c" fn` underneath.
-//!
-//! Why an import and not `@cImport`? Zig 0.16 deprecated source-level
-//! `@cImport` in favor of running translate-c through the build system.
-//! The wiring lives in `build.zig` (`b.addTranslateC` + `addImport`).
-//!
-//! SQLite's "prepared statement" lifecycle is:
-//!     prepare → bind args → step (until SQLITE_DONE or row) → finalize
-//! We follow this dance for every query, using `defer` to make sure
-//! `finalize` always runs.
+//! Bindings come from translate-c run over `src/sqlite_c.h` and wired into
+//! the build as the `sqlite_c` module (see `build.zig`). 0.16 deprecated
+//! source-level `@cImport` in favor of build-system translate-c.
 
 const std = @import("std");
 
-// `@import("sqlite_c")` pulls in the translate-c output that build.zig
-// wired up under that name. The module exposes every `sqlite3_*` symbol
-// and every `SQLITE_*` constant from sqlite3.h.
 pub const c = @import("sqlite_c");
 
-// SQLITE_TRANSIENT (((destructor_type)-1)) and SQLITE_STATIC (0) are
-// sentinel "function pointers" defined as macros in the SQLite header.
-// translate-c can't fold them into a typed fn-pointer at comptime because
-// Zig requires fn pointers to be aligned, and `-1`/`0` aren't.
+// SQLite's `SQLITE_TRANSIENT` and `SQLITE_STATIC` are macros expanding to
+// `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits
+// them as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check
+// at comptime.
 //
-// All callers below keep the bound buffers alive until after `finalize` —
-// so SQLITE_STATIC semantics are correct, and we can simply pass null as
-// the destructor. SQLite treats null as "no destructor, caller manages
-// the buffer's lifetime", which is exactly what we want.
+// All bind sites below keep buffers alive past `sqlite3_finalize`, so
+// SQLITE_STATIC semantics hold and we can pass null (SQLite treats null
+// as "caller manages buffer lifetime").
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
-// ---- Error set --------------------------------------------------------------
-//
-// In Zig, errors are values from named *error sets*. This declares a set
-// with six possible error values. Functions can return `Error!T` to mean
-// "either a success of type T, or one of these errors." Errors are
-// enum-like value tags with zero runtime cost — no allocation, no
-// stack-trace capture unless one actually propagates to a panic.
 pub const Error = error{
     OpenFailed,
     PrepareFailed,
@@ -58,8 +34,6 @@ pub const Error = error{
     OutOfMemory,
 };
 
-// A search result row, with `content` already copied into caller-owned
-// memory (so the caller is responsible for freeing it).
 pub const Entry = struct {
     id: i64,
     content: []u8, // owned by caller's allocator
@@ -67,39 +41,24 @@ pub const Entry = struct {
 };
 
 pub const Db = struct {
-    // `*c.sqlite3` is a pointer to SQLite's connection struct. We never
-    // look inside it; SQLite gives us the pointer and we hand it back.
     handle: *c.sqlite3,
     allocator: std.mem.Allocator,
 
-    /// Open or create the database at `path`, initialise schema and pragmas.
-    ///
-    /// `path: [:0]const u8` is a 0-terminated slice (Zig's representation
-    /// of "this is safe to pass to a C function expecting `const char *`").
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) Error!Db {
-        // `?*c.sqlite3` is an *optional* pointer — possibly null. We give
-        // SQLite its address via `&h`; SQLite fills it in.
         var h: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(path.ptr, &h);
         if (rc != c.SQLITE_OK or h == null) {
-            // Even on failure, SQLite may have allocated a handle that
-            // needs closing. `if (h) |hh|` unwraps the optional: "if h is
-            // non-null, bind the inner pointer to `hh` and run the body."
-            // `_ = expr` discards a return value (Zig insists you do
-            // *something* with every value).
+            // Failed open may still allocate a handle that needs closing.
             if (h) |hh| _ = c.sqlite3_close(hh);
             return Error.OpenFailed;
         }
-        // `h.?` is the *unwrap* operator. Since we've just checked that
-        // h is non-null, `h.?` safely extracts the inner pointer. If we
-        // were wrong and h were null, this would panic.
         var db: Db = .{ .handle = h.?, .allocator = allocator };
 
-        // WAL mode: lets readers run concurrently with one writer (vs the
-        // default which serialises everything via a rollback journal).
+        // WAL lets CLI readers run concurrently with daemon writes
+        // instead of serialising through a rollback journal.
         try db.exec("PRAGMA journal_mode=WAL;");
-        // synchronous=NORMAL trades a tiny crash-recovery risk for a big
-        // throughput win. fine for a clipboard history.
+        // synchronous=NORMAL: tiny crash-recovery risk for big throughput.
+        // Fine for clipboard history.
         try db.exec("PRAGMA synchronous=NORMAL;");
         try db.exec(
             \\CREATE TABLE IF NOT EXISTS entries (
@@ -118,17 +77,9 @@ pub const Db = struct {
         _ = c.sqlite3_close(self.handle);
     }
 
-    /// Execute a one-off SQL statement (no parameters, no result rows).
-    /// Used for pragmas and CREATE TABLE/INDEX.
+    /// One-off statement (no parameters, no result rows). For pragmas and DDL.
     pub fn exec(self: *Db, sql: []const u8) Error!void {
         var err: [*c]u8 = null;
-        // `[*c]u8` is the "C pointer" type — semi-magical, can be null,
-        // can be cast to many things. Used here because that's exactly
-        // what sqlite3_exec wants as out-param for the error message.
-        //
-        // dupeSentinel makes a 0-terminated copy. We could also just pass
-        // `sql.ptr` if we knew the caller always provided a sentinel
-        // slice — but the API takes plain `[]const u8` for convenience.
         const z = self.allocator.dupeSentinel(u8, sql, 0) catch return Error.OutOfMemory;
         defer self.allocator.free(z);
         const rc = c.sqlite3_exec(self.handle, z.ptr, null, null, &err);
@@ -138,17 +89,12 @@ pub const Db = struct {
         }
     }
 
-    /// Helper for the prepare → step pattern. Returns the prepared
-    /// statement, which the caller is responsible for finalising (use
-    /// `defer _ = c.sqlite3_finalize(stmt);`).
+    /// Caller must `defer _ = c.sqlite3_finalize(stmt);` on the result.
     fn prepare(self: *Db, sql: []const u8) Error!*c.sqlite3_stmt {
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(
             self.handle,
             sql.ptr,
-            // `@intCast` converts between integer types. sql.len is usize,
-            // sqlite3_prepare_v2 wants c_int. The cast asserts the value
-            // fits (true for any reasonable SQL string).
             @intCast(sql.len),
             &stmt,
             null,
@@ -157,35 +103,28 @@ pub const Db = struct {
         return stmt.?;
     }
 
-    /// Upsert by content hash.
-    /// Returns true if a new row was inserted, false if an existing row's
-    /// `copied_at` was bumped.
+    /// Upsert by content hash. Returns true if a new row was inserted,
+    /// false if an existing row's `copied_at` was bumped.
     pub fn upsertByHash(
         self: *Db,
         content: []const u8,
         hash: []const u8,
         now: i64,
     ) Error!bool {
-        // ---- 1. Look up existing row by hash ----
         const find_sql = "SELECT id FROM entries WHERE hash = ? LIMIT 1;";
         const find_stmt = try self.prepare(find_sql);
-        // `defer` schedules cleanup at scope exit. Pair acquisition with
-        // release immediately so it's visually obvious nothing leaks.
         defer _ = c.sqlite3_finalize(find_stmt);
 
         if (c.sqlite3_bind_blob(
             find_stmt,
-            1, // 1-based parameter index (the first `?`)
+            1,
             hash.ptr,
             @intCast(hash.len),
             SQLITE_STATIC,
         ) != c.SQLITE_OK) return Error.BindFailed;
 
-        // `sqlite3_step` returns SQLITE_ROW if a row is ready, SQLITE_DONE
-        // if no more rows, or an error code otherwise.
         const step_rc = c.sqlite3_step(find_stmt);
         if (step_rc == c.SQLITE_ROW) {
-            // Found a match — bump its copied_at.
             const existing_id = c.sqlite3_column_int64(find_stmt, 0);
             const upd = try self.prepare("UPDATE entries SET copied_at = ? WHERE id = ?;");
             defer _ = c.sqlite3_finalize(upd);
@@ -197,7 +136,6 @@ pub const Db = struct {
             return Error.StepFailed;
         }
 
-        // ---- 2. No existing row — insert a fresh one ----
         const ins = try self.prepare(
             "INSERT INTO entries (content, hash, copied_at) VALUES (?, ?, ?);",
         );
@@ -221,8 +159,8 @@ pub const Db = struct {
         return true;
     }
 
-    /// Bump `copied_at` on an existing row without touching content/hash.
-    /// Used by `zclip use` so the just-used entry surfaces as most recent.
+    /// Bump `copied_at` without touching content/hash. Used by `zclip use`
+    /// so the just-used entry surfaces as most recent.
     pub fn touch(self: *Db, id: i64, now: i64) Error!void {
         const stmt = try self.prepare("UPDATE entries SET copied_at = ? WHERE id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -231,15 +169,13 @@ pub const Db = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return Error.StepFailed;
     }
 
-    /// Substring search via SQL LIKE. `keyword` is wrapped with `%`.
-    /// Caller owns the returned slice and each `entry.content` — use
-    /// `freeEntries` to release everything.
+    /// Substring search via LIKE. Caller owns the returned slice and each
+    /// `entry.content` — release everything via `freeEntries`.
     pub fn search(
         self: *Db,
         keyword: []const u8,
         limit: u32,
     ) Error![]Entry {
-        // Build the LIKE pattern dynamically — needs allocation.
         const pattern = std.fmt.allocPrint(
             self.allocator,
             "%{s}%",
@@ -247,8 +183,6 @@ pub const Db = struct {
         ) catch return Error.OutOfMemory;
         defer self.allocator.free(pattern);
 
-        // `++` is Zig's compile-time string concatenation. Lets us split
-        // a long SQL literal across lines without runtime cost.
         const stmt = try self.prepare(
             "SELECT id, content, copied_at FROM entries " ++
                 "WHERE content LIKE ? ESCAPE '\\' " ++
@@ -265,15 +199,10 @@ pub const Db = struct {
         ) != c.SQLITE_OK) return Error.BindFailed;
         if (c.sqlite3_bind_int(stmt, 2, @intCast(limit)) != c.SQLITE_OK) return Error.BindFailed;
 
-        // `.empty` is the canonical empty-ArrayList value (idiomatic in
-        // Zig 0.14+). Equivalent to `ArrayList(Entry).init(...)` in older
-        // versions but doesn't require an allocator until you actually
-        // append something.
         var out: std.ArrayList(Entry) = .empty;
 
-        // `errdefer` is like `defer` but only runs if the function returns
-        // an *error*. On success the caller takes ownership of `out` and
-        // these frees would be a use-after-free; on error we clean up.
+        // errdefer (not defer): on success, caller owns `out` and freeing
+        // here would be a use-after-free.
         errdefer {
             for (out.items) |e| self.allocator.free(e.content);
             out.deinit(self.allocator);
@@ -285,10 +214,6 @@ pub const Db = struct {
             if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
             const id = c.sqlite3_column_int64(stmt, 0);
-            // `sqlite3_column_text` returns a `[*c]const u8` — a C
-            // "anything-goes" pointer. We re-cast to `[*]const u8` (Zig's
-            // many-item pointer) and slice it with `[0..len]` to get a
-            // proper `[]const u8`.
             const text_ptr = c.sqlite3_column_text(stmt, 1);
             const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
             const content = self.allocator.dupe(
@@ -303,19 +228,16 @@ pub const Db = struct {
             }) catch return Error.OutOfMemory;
         }
 
-        // `toOwnedSlice` converts the ArrayList into a plain `[]Entry`
-        // slice. The ArrayList's header is freed; the data buffer is
-        // handed off to the caller.
         return out.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
     }
 
-    /// Fetch a single entry's content by id. Caller owns the slice.
+    /// Fetch one entry's content by id. Caller owns the slice.
     pub fn getById(self: *Db, id: i64) Error!?[]u8 {
         const stmt = try self.prepare("SELECT content FROM entries WHERE id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return Error.BindFailed;
         const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) return null; // no row matched
+        if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
         const text_ptr = c.sqlite3_column_text(stmt, 0);
         const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
@@ -326,8 +248,8 @@ pub const Db = struct {
     }
 };
 
-/// Free a slice returned by `search` — both the per-entry `content`
-/// buffers and the slice itself.
+/// Free a slice returned by `search` — both per-entry `content` buffers
+/// and the slice itself.
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     for (entries) |e| allocator.free(e.content);
     allocator.free(entries);
