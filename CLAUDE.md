@@ -21,7 +21,7 @@ DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/
 
 ```
 src/main.zig       CLI router, search/use commands, ISO timestamp formatting
-src/clipboard.zig  NSPasteboard wrapper (hand-rolled objc_msgSend FFI)
+src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
 src/db.zig         SQLite wrapper (@cImport sqlite3.h)
 src/daemon.zig     Poll loop, pidfile flock, signal handlers, mkdir -p
 build.zig          Links sqlite3, AppKit, Foundation; link_libc
@@ -64,6 +64,10 @@ index on hash, index on copied_at
 ```
 
 Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
+
+## Comment style
+
+Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those. All source files trimmed 2026-05-28.
 
 ## Things deliberately not done (post-POC)
 
