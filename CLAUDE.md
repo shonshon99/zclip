@@ -2,8 +2,24 @@
 
 Persistent clipboard history daemon for macOS. Zig + libsqlite3 + NSPasteboard.
 
-Design doc: `zclip-handoff.md` (motivation, schema rationale, post-POC roadmap).
-This file: just what a future Claude session needs to be productive immediately.
+This file: what a future Claude session needs to be productive immediately.
+Forward-looking roadmap + Raycast-complement strategy: `ROADMAP.md`.
+
+## Workflow context — READ FIRST
+
+Primary clipboard UX = **Raycast** (history picker + named snippets with dynamic placeholders). Raycast retains ~1 month; snippets are static, content-only.
+
+**zclip's role: long-term back-of-house archive.** Not a picker. Specializes in what Raycast structurally cannot offer:
+
+- Permanent retention (years, not weeks)
+- Rich metadata captured at copy time (source app, URL provenance, project/cwd) — planned
+- Programmatic CLI access (pipe, query, export)
+- Insights derivable only from long-tail history
+- Safety guarantees that scale with retention (encryption at rest, secret audits)
+
+Do NOT rebuild Raycast's picker UI. Do NOT compete on snippet expansion. Complement.
+
+Build order and deferred features live in `ROADMAP.md`. Update that file when scope shifts.
 
 ## Commands
 
@@ -34,6 +50,8 @@ build.zig.zon      minimum_zig_version = "0.16.0"
 
 Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. The codebase uses 0.16-idiomatic APIs throughout: `pub fn main(init: std.process.Init)`, `std.Io.File.Writer`, `std.Io.Dir.createFile` with advisory lock options, `std.Io.sleep`, `std.Io.Timestamp.now`, `init.minimal.environ.getPosix`. If you bump or downgrade Zig, expect rework in `main.zig` and `daemon.zig` first.
 
+Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-generated Zig as a draft — compile with the pinned version immediately, cross-check stdlib symbols against the 0.16 release notes, and trust the compiler error over the LLM.
+
 ## Critical gotchas
 
 **Signal handling stays on libc.** `daemon.zig` declares `extern "c" fn signal` and uses raw `SIGINT`/`SIGTERM` constants because `std.posix.sigaction` on Darwin requires a typed-enum handler signature that's awkward to satisfy, and 0.16's Io interface doesn't expose signal handlers. Don't try to "modernize" this without checking the Darwin sigaction prototype first.
@@ -48,7 +66,7 @@ Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. The codebase use
 
 **Origin marker prevents daemon feedback loop.** `zclip use` writes content tagged with custom type `dev.zclip.origin`. Daemon's poll checks `pb.hasOrigin()` and skips. Don't strip this from `writeStringAsOrigin`.
 
-**Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext.
+**Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext. This is defense-in-depth only — apps that don't set the type (Slack, browsers pasting from docs) bypass it. Long-term mitigation is encryption at rest + retroactive secret audit (`ROADMAP.md` step 6).
 
 **WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
 
@@ -61,18 +79,14 @@ index on hash, index on copied_at
 
 Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
 
+Schema lives inline in `db.zig`. No migration runner yet — introduce one (`PRAGMA user_version` based) before the first column addition. `ROADMAP.md` step 1 (source-app + URL provenance) is the trigger.
+
 ## Comment style
 
 Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those. All source files trimmed 2026-05-28.
 
-## Things deliberately not done (post-POC)
+## Known tradeoffs
 
-- launchd `.plist` for auto-start at login
-- FTS5 (currently `LIKE '%keyword%'`)
-- Non-text clipboard (images, files, RTF)
-- Encryption at rest
-- Eviction / retention limits
-- Relative timestamps (currently ISO `YYYY-MM-DD HH:MM`)
-- `zclip status`, `zclip pin`, `zclip create` named snippets
-
-When adding any of these, update `zclip-handoff.md` extensions table and note schema migrations explicitly — there's no migration runner yet (schema lives inline in `db.zig`).
+- **DB growth is unbounded by design.** Permanent retention is the value proposition vs. Raycast. Pruning via raw SQL is always available; auto-eviction intentionally not implemented.
+- **Plaintext at rest.** Concealed-type filter catches password-manager copies, but anything not flagged (API keys pasted from docs, tokens in terminal output) ends up readable on disk. FileVault covers stolen-laptop threat; same-account access still sees plaintext. Mitigation tracked in `ROADMAP.md` step 6.
+- **Polling latency.** 1-second poll loses copies made and overwritten inside the gap. macOS exposes no public pasteboard-change notification — polling is the standard approach across clipboard tools.
