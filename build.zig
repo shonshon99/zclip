@@ -24,6 +24,14 @@ pub fn build(b: *std.Build) void {
     // Expose the translated SQLite bindings to Zig source as
     // `@import("sqlite_c")`.
     root_mod.addImport("sqlite_c", sqlite_c.createModule());
+    // mitchellh/zig-objc — Objective-C runtime bindings. Replaces the
+    // hand-rolled `objc_msgSend` FFI plumbing that used to live in
+    // `clipboard.zig`. Exposed to Zig source as `@import("objc")`.
+    const zig_objc = b.dependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    root_mod.addImport("objc", zig_objc.module("objc"));
     // Link the actual SQLite library so the translated declarations
     // resolve at link time. translate-c only generates *headers* — the
     // linker still needs the .dylib.

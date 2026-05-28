@@ -14,134 +14,51 @@
 //!
 //! So when the Obj-C programmer writes:
 //!     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-//! the compiler emits:
+//! the compiler emits something like:
 //!     pb = objc_msgSend(objc_getClass("NSPasteboard"),
 //!                       sel_registerName("generalPasteboard"));
 //!
-//! Zig has no Obj-C compiler. So we manually call those same C runtime
-//! functions ourselves. The result is identical machine code — we just
-//! type out by hand what the Obj-C compiler would have generated.
+//! Zig has no Obj-C compiler. We used to hand-roll those runtime calls
+//! ourselves — declaring `objc_msgSend` as a void stub and casting its
+//! address to a different fn-pointer type at each call site. That worked
+//! but every selector added two things: a `Send*` typedef and a cast.
 //!
-//! We declare the runtime symbols ourselves rather than `@cImport`ing
-//! `<objc/runtime.h>` to keep the API surface tiny and avoid
-//! Objective-C header surprises through translate-c.
+//! Now we use mitchellh/zig-objc, which wraps `libobjc` once. The lib
+//! provides:
+//!   - `objc.Class`           — handle to a class (e.g. NSPasteboard)
+//!   - `objc.Object`          — handle to an instance (e.g. one NSString)
+//!   - `Class.msgSend(R, sel, .{args})` / `Object.msgSend(...)`
+//!         At comptime, the lib builds the right fn-pointer type from
+//!         the Return type and the args tuple, then casts the underlying
+//!         `objc_msgSend` symbol to that type and calls it. End result:
+//!         identical machine code to what we wrote by hand, no per-site
+//!         scaffolding.
+//!
+//! On ARM64 there's one msgSend variant. On x86_64 the lib also picks
+//! `objc_msgSend_stret` / `_fpret` when needed — our hand-rolled code
+//! ignored that, which would have bitten us if we ever returned a large
+//! struct by value.
 
 const std = @import("std");
-
-// ---- Opaque types ------------------------------------------------------------
-//
-// `opaque {}` declares a type with unknown layout. Zig refuses to let you
-// dereference, copy, or take `sizeof` of it. You can only hold pointers to
-// it. This matches C's `typedef struct objc_class *Class;` pattern: we
-// never look inside these structs, we just pass pointers around.
-const objc_class = opaque {};
-const objc_object = opaque {};
-const objc_selector = opaque {};
-
-// `Class` is a non-nullable pointer to a class.
-// `Id` is a nullable pointer to an object — Objective-C methods can return
-// `nil`, which we represent with Zig's optional (`?`) type.
-// `Sel` is a pointer to an interned method-name token.
-pub const Class = *objc_class;
-pub const Id = ?*objc_object;
-pub const Sel = *objc_selector;
-
-// ---- External function declarations -----------------------------------------
-//
-// `extern "c" fn` is doing two things at once:
-//   1. `extern`     — "this function isn't defined in our Zig source. The
-//                     linker will find a symbol with this name in some
-//                     shared library." Here, libobjc (pulled in via the
-//                     AppKit framework link in build.zig).
-//   2. `"c"`        — "use the C calling convention." On macOS that's the
-//                     standard AAPCS64 / AMD64 SysV ABI. Zig is otherwise
-//                     free to use its own internal calling convention.
-//
-// `[*:0]const u8` reads "a many-item pointer to `const u8`, sentinel-
-// terminated by 0". That's a C-style `const char *`.
-
-extern "c" fn objc_getClass(name: [*:0]const u8) ?Class;
-extern "c" fn sel_registerName(name: [*:0]const u8) Sel;
-
-// `objc_msgSend` is the universal Objective-C method dispatcher. Its real
-// signature changes per call — sometimes it takes 2 args and returns an
-// object, sometimes 3 args and returns an integer, etc. C handles this
-// with varargs; we handle it by casting `&objc_msgSend` to the right
-// function-pointer type at each call site (see the `msg` helper below).
-//
-// We declare it as taking nothing and returning void here purely as a
-// symbol stub — we never call it through this declaration directly.
-extern "c" fn objc_msgSend() void;
-
-// ---- Small helpers -----------------------------------------------------------
-
-// Re-type a `Class` pointer as an `Id`. In Objective-C, classes *are*
-// objects (they're instances of metaclasses), so the message receiver in
-// `objc_msgSend` can be either.
-fn classAsId(c: Class) Id {
-    return @ptrCast(c);
-}
-
-// Look up a class, panicking if it's missing. Misspelled class names are
-// a programming bug, not a runtime failure, so panic is appropriate.
-fn requireClass(name: [*:0]const u8) Class {
-    return objc_getClass(name) orelse std.debug.panic("Objective-C class missing: {s}", .{name});
-}
-
-// ---- msgSend signature shims ------------------------------------------------
-//
-// Each alias describes a possible shape of `objc_msgSend`. Read each as
-// "pointer to a function with this signature, using the C calling
-// convention." We use them with `@ptrCast(&objc_msgSend)` to call
-// `objc_msgSend` with the right argument and return types per call site.
-//
-// Naming: SendABCD_E means "send takes (A, B, C, D), returns E".
-//   - Id     = an Obj-C object pointer (nullable)
-//   - Sel    = a selector
-//   - Long   = c_long return (used for integer-returning methods)
-//   - Cstr   = a `[*:0]const u8` (C string)
-//   - Void   = no return value
-
-const SendIdToId = *const fn (Id, Sel) callconv(.c) Id;
-const SendIdToLong = *const fn (Id, Sel) callconv(.c) c_long;
-const SendIdToVoid = *const fn (Id, Sel) callconv(.c) void;
-const SendIdId_Id = *const fn (Id, Sel, Id) callconv(.c) Id;
-const SendIdId_Void = *const fn (Id, Sel, Id) callconv(.c) void;
-const SendIdIdId_Void = *const fn (Id, Sel, Id, Id) callconv(.c) void;
-const SendIdCstr_Id = *const fn (Id, Sel, [*:0]const u8) callconv(.c) Id;
-const SendIdToCstr = *const fn (Id, Sel) callconv(.c) [*:0]const u8;
-
-// `comptime T: type` means "the parameter T is a *type*, known at compile
-// time". Zig generates a separate copy of `msg` for each T we pass.
-//
-// `@ptrCast(&objc_msgSend)` re-interprets the address of `objc_msgSend`
-// as a pointer of a different type. `@as(T, value)` then asserts that
-// value coerces to T at compile time.
-//
-// End result: `msg(SendIdToLong)` returns `&objc_msgSend` re-typed as
-// `*const fn(Id, Sel) callconv(.c) c_long`, ready to be called with that
-// shape.
-fn msg(comptime T: type) T {
-    return @as(T, @ptrCast(&objc_msgSend));
-}
+const objc = @import("objc");
 
 // ---- NSString conversion helpers --------------------------------------------
 //
 // Most NSPasteboard methods want `NSString *` (an Obj-C object), not a
 // plain C string. To bridge, we call `[NSString stringWithUTF8String:cstr]`
-// — itself just another message send.
+// — itself just another message send, now expressed via `Class.msgSend`.
 
 // Build an autoreleased NSString from a C string. The returned object is
 // owned by the autorelease pool, so don't hold it across pool boundaries.
-fn nsStringFromCStr(s: [*:0]const u8) Id {
-    const NSString = classAsId(requireClass("NSString"));
-    return msg(SendIdCstr_Id)(NSString, sel_registerName("stringWithUTF8String:"), s);
+fn nsStringFromCStr(s: [*:0]const u8) objc.Object {
+    const NSString = objc.getClass("NSString").?;
+    return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{s});
 }
 
 // Same but takes a Zig slice. `dupeSentinel` makes a 0-terminated copy
 // because the C function needs a null terminator. We free our copy right
 // away; the NSString has already copied the bytes internally.
-fn nsStringFromSlice(allocator: std.mem.Allocator, s: []const u8) !Id {
+fn nsStringFromSlice(allocator: std.mem.Allocator, s: []const u8) !objc.Object {
     const z = try allocator.dupeSentinel(u8, s, 0);
     defer allocator.free(z);
     return nsStringFromCStr(z.ptr);
@@ -149,19 +66,17 @@ fn nsStringFromSlice(allocator: std.mem.Allocator, s: []const u8) !Id {
 
 // Pull the UTF-8 bytes out of an NSString by calling `[ns UTF8String]`.
 // Returns null if the NSString itself is nil.
-fn cStrFromNSString(ns: Id) ?[*:0]const u8 {
-    if (ns == null) return null;
-    return msg(SendIdToCstr)(ns, sel_registerName("UTF8String"));
+fn cStrFromNSString(ns: objc.Object) ?[*:0]const u8 {
+    if (ns.value == null) return null;
+    return ns.msgSend([*:0]const u8, "UTF8String", .{});
 }
 
 // ---- Public API: the Pasteboard wrapper -------------------------------------
-//
-// A Zig `struct` can have data fields, `pub const` constants, and methods
-// (just functions whose first parameter is `self`).
 
 pub const Pasteboard = struct {
-    // One field: the underlying Obj-C pasteboard object pointer.
-    pb: Id,
+    // One field: the underlying Obj-C pasteboard object handle. `objc.Object`
+    // wraps the raw `id` (nullable pointer) and adds the `.msgSend` method.
+    pb: objc.Object,
 
     // Constants visible to other files as `Pasteboard.origin_type`, etc.
     /// Custom pasteboard type set on entries written by `zclip use` so the
@@ -177,11 +92,13 @@ pub const Pasteboard = struct {
 
     /// Static factory method — Objective-C equivalent:
     ///     NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    ///
+    /// `objc.getClass` returns `?objc.Class`. The `.?` unwraps the optional
+    /// and panics if NSPasteboard is missing — a missing AppKit class is a
+    /// linker/SDK bug, not a runtime condition we can recover from.
     pub fn general() Pasteboard {
-        const NSPasteboard = classAsId(requireClass("NSPasteboard"));
-        const pb = msg(SendIdToId)(NSPasteboard, sel_registerName("generalPasteboard"));
-        // `.{ .pb = pb }` is an anonymous struct literal. Zig infers the
-        // struct type (Pasteboard) from the function return type.
+        const NSPasteboard = objc.getClass("NSPasteboard").?;
+        const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
         return .{ .pb = pb };
     }
 
@@ -189,11 +106,11 @@ pub const Pasteboard = struct {
     /// every time something is written to it, so it's the cheapest way to
     /// detect "did anything change?" without reading the content.
     pub fn changeCount(self: Pasteboard) i64 {
-        // `@intCast(x)` converts between integer types when the value fits
+        // `@intCast` converts between integer types when the value fits
         // at runtime (panics in debug builds if it doesn't). Here
         // c_long → i64. On 64-bit macOS they're the same size, but
         // c_long's width is platform-dependent so the cast is explicit.
-        return @intCast(msg(SendIdToLong)(self.pb, sel_registerName("changeCount")));
+        return @intCast(self.pb.msgSend(c_long, "changeCount", .{}));
     }
 
     /// Returns true if any of the pasteboard's available types matches
@@ -207,28 +124,19 @@ pub const Pasteboard = struct {
         const wanted_ns = nsStringFromCStr(wanted);
 
         // `[self.pb types]` — get the NSArray of type identifiers.
-        const types = msg(SendIdToId)(self.pb, sel_registerName("types"));
-        if (types == null) return false;
+        const types = self.pb.msgSend(objc.Object, "types", .{});
+        if (types.value == null) return false;
 
         // `[types count]` — length of the array.
-        const count = msg(SendIdToLong)(types, sel_registerName("count"));
+        const count = types.msgSend(c_long, "count", .{});
 
         var i: c_long = 0;
         while (i < count) : (i += 1) {
-            // One-off call shape: takes a c_long arg, returns an object.
-            // Cast inline instead of adding another named alias.
-            const item = @as(
-                *const fn (Id, Sel, c_long) callconv(.c) Id,
-                @ptrCast(&objc_msgSend),
-            )(types, sel_registerName("objectAtIndex:"), i);
-
-            // [item isEqualToString:wanted_ns] → bool.
-            const eq = @as(
-                *const fn (Id, Sel, Id) callconv(.c) bool,
-                @ptrCast(&objc_msgSend),
-            )(item, sel_registerName("isEqualToString:"), wanted_ns);
-
-            if (eq) return true;
+            // `objectAtIndex:` is just another `msgSend`. The lib infers
+            // that the arg is `c_long` from the tuple type — no per-site
+            // fn-pointer cast needed.
+            const item = types.msgSend(objc.Object, "objectAtIndex:", .{i});
+            if (item.msgSend(bool, "isEqualToString:", .{wanted_ns})) return true;
         }
         return false;
     }
@@ -251,7 +159,7 @@ pub const Pasteboard = struct {
     pub fn readString(self: Pasteboard, allocator: std.mem.Allocator) !?[]u8 {
         const t = nsStringFromCStr(string_type);
         // [self.pb stringForType:t] → NSString *
-        const ns = msg(SendIdId_Id)(self.pb, sel_registerName("stringForType:"), t);
+        const ns = self.pb.msgSend(objc.Object, "stringForType:", .{t});
         const cstr = cStrFromNSString(ns) orelse return null;
         const slice = std.mem.span(cstr);
         // Critical: copy the bytes into caller-owned memory. The NSString
@@ -270,26 +178,16 @@ pub const Pasteboard = struct {
     ///     [pb setString:@"1"   forType:@"dev.zclip.origin"];
     pub fn writeStringAsOrigin(self: Pasteboard, allocator: std.mem.Allocator, content: []const u8) !void {
         // clearContents returns a new changeCount (NSInteger) which we discard.
-        _ = msg(SendIdToLong)(self.pb, sel_registerName("clearContents"));
+        _ = self.pb.msgSend(c_long, "clearContents", .{});
 
         const content_ns = try nsStringFromSlice(allocator, content);
         const string_t = nsStringFromCStr(string_type);
-        msg(SendIdIdId_Void)(
-            self.pb,
-            sel_registerName("setString:forType:"),
-            content_ns,
-            string_t,
-        );
+        self.pb.msgSend(void, "setString:forType:", .{ content_ns, string_t });
 
         // The origin tag — value can be anything non-empty; we just need
         // the *type* to be present so `hasOrigin()` returns true.
         const origin_ns = nsStringFromCStr("1");
         const origin_t = nsStringFromCStr(origin_type);
-        msg(SendIdIdId_Void)(
-            self.pb,
-            sel_registerName("setString:forType:"),
-            origin_ns,
-            origin_t,
-        );
+        self.pb.msgSend(void, "setString:forType:", .{ origin_ns, origin_t });
     }
 };
