@@ -44,9 +44,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cmd = args[1];
+    const environ = init.minimal.environ;
 
     if (std.mem.eql(u8, cmd, "daemon")) {
-        try daemon.run(alloc, out);
+        try daemon.run(alloc, io, environ, out);
         return;
     }
     if (std.mem.eql(u8, cmd, "search")) {
@@ -55,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
             try err.flush();
             std.process.exit(2);
         }
-        try runSearch(alloc, out, args[2]);
+        try runSearch(alloc, environ, out, args[2]);
         try out.flush();
         return;
     }
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
             try err.flush();
             std.process.exit(2);
         };
-        try runUse(alloc, out, err, id);
+        try runUse(alloc, environ, io, out, err, id);
         try out.flush();
         return;
     }
@@ -81,9 +82,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // Returns sentinel-0 slice — SQLite's C API needs `const char *`.
-fn dbPath(allocator: std.mem.Allocator) ![:0]u8 {
-    const home_cstr = std.c.getenv("HOME") orelse return error.MissingHome;
-    const home = std.mem.span(home_cstr);
+fn dbPath(allocator: std.mem.Allocator, environ: std.process.Environ) ![:0]u8 {
+    const home = environ.getPosix("HOME") orelse return error.MissingHome;
     return std.fmt.allocPrintSentinel(
         allocator,
         "{s}/.local/share/zclip/history.db",
@@ -92,8 +92,13 @@ fn dbPath(allocator: std.mem.Allocator) ![:0]u8 {
     );
 }
 
-fn runSearch(allocator: std.mem.Allocator, w: anytype, keyword: []const u8) !void {
-    const path = try dbPath(allocator);
+fn runSearch(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    w: anytype,
+    keyword: []const u8,
+) !void {
+    const path = try dbPath(allocator, environ);
     defer allocator.free(path);
 
     var db = try db_mod.Db.open(allocator, path);
@@ -115,8 +120,15 @@ fn runSearch(allocator: std.mem.Allocator, w: anytype, keyword: []const u8) !voi
     }
 }
 
-fn runUse(allocator: std.mem.Allocator, w: anytype, err: anytype, id: i64) !void {
-    const path = try dbPath(allocator);
+fn runUse(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    io: Io,
+    w: anytype,
+    err: anytype,
+    id: i64,
+) !void {
+    const path = try dbPath(allocator, environ);
     defer allocator.free(path);
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
@@ -130,7 +142,7 @@ fn runUse(allocator: std.mem.Allocator, w: anytype, err: anytype, id: i64) !void
 
     const pb = clipboard.Pasteboard.general();
     try pb.writeStringAsOrigin(allocator, content);
-    try db.touch(id, daemon.unixNow());
+    try db.touch(id, daemon.unixNow(io));
     try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, content.len });
 }
 

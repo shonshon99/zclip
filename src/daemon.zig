@@ -1,51 +1,18 @@
 //! Polling daemon: every 1s, read NSPasteboard.changeCount, and if it
 //! moved, insert/update the SQLite entry.
 //!
-//! Single-instance enforced with flock on a pidfile.
+//! Single-instance enforced via advisory file lock on the pidfile.
 //! SIGINT/SIGTERM trigger a clean shutdown via an atomic flag.
-//!
-//! Leans on libc directly because Zig 0.16's std was mid-refactor and
-//! most `std.posix` / `std.fs` wrappers were temporarily missing.
 
 const std = @import("std");
+const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-
-// ---- libc bindings ----------------------------------------------------------
-
-extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn flock(fd: c_int, op: c_int) c_int;
-extern "c" fn ftruncate(fd: c_int, length: c_long) c_int;
-extern "c" fn pwrite(fd: c_int, buf: [*]const u8, n: usize, offset: c_long) isize;
-extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
-
-// Darwin-specific values — Linux differs (notably O_CREAT=0x40 on Linux).
-const O_WRONLY: c_int = 0x0001;
-const O_CREAT: c_int = 0x0200;
-const LOCK_EX: c_int = 2;
-const LOCK_NB: c_int = 4;
-const F_OK: c_int = 0;
-
-// `extern struct` forces C layout so the kernel sees the fields where it
-// expects them.
-const Timespec = extern struct { sec: c_long, nsec: c_long };
-extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
-extern "c" fn time(t: ?*c_long) c_long;
-
-pub fn unixNow() i64 {
-    return @intCast(time(null));
-}
-
-fn sleepSeconds(s: c_long) void {
-    const req = Timespec{ .sec = s, .nsec = 0 };
-    _ = nanosleep(&req, null);
-}
 
 const clipboard = @import("clipboard.zig");
 const db_mod = @import("db.zig");
 const objc = @import("objc");
 
-const poll_interval_sec: c_long = 1;
+const poll_interval: Io.Duration = .fromSeconds(1);
 
 // ---- Signal handling --------------------------------------------------------
 
@@ -72,51 +39,71 @@ fn getpid() i32 {
     return @intCast(std.c.getpid());
 }
 
-fn writePid(fd: c_int) !void {
-    _ = ftruncate(fd, 0);
-    var buf: [32]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{d}\n", .{getpid()});
-    _ = pwrite(fd, s.ptr, s.len, 0);
+/// Unix epoch seconds via the `real` (wall-clock) Io clock.
+pub fn unixNow(io: Io) i64 {
+    const ns = Io.Timestamp.now(io, .real).nanoseconds;
+    return @intCast(@divTrunc(ns, std.time.ns_per_s));
 }
 
-/// Main entry point for `zclip daemon`. Sets up the storage dir, takes
-/// the pidfile lock, opens SQLite, then enters the poll loop until a
-/// signal flips `running` to false.
-pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
+fn writePid(file: Io.File, io: Io) !void {
+    try file.setLength(io, 0);
+    var buf: [32]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d}\n", .{getpid()});
+    try file.writePositionalAll(io, s, 0);
+}
+
+/// Main entry point for `zclip daemon`. Verifies storage dir, takes the
+/// pidfile lock, opens SQLite, then enters the poll loop until a signal
+/// flips `running` to false.
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    log_w: anytype,
+) !void {
     installSignalHandlers();
 
-    // Sentinel-0 paths because access/flock/SQLite all take `const char *`.
-    const home_cstr = std.c.getenv("HOME") orelse return error.MissingHome;
-    const home = std.mem.span(home_cstr);
-    const dir_path = try std.fmt.allocPrintSentinel(allocator, "{s}/.local/share/zclip", .{home}, 0);
+    const home = environ.getPosix("HOME") orelse return error.MissingHome;
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.local/share/zclip", .{home});
     defer allocator.free(dir_path);
 
     // Deliberately do NOT auto-create the storage dir — print an
     // actionable hint and bail. User must opt in.
-    if (access(dir_path.ptr, F_OK) != 0) {
-        try log_w.print("zclip daemon: storage directory missing: {s}\n", .{dir_path});
-        try log_w.print("  create it with: mkdir -p {s}\n", .{dir_path});
-        try log_w.flush();
-        return error.MissingStorageDir;
-    }
+    Io.Dir.cwd().access(io, dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            try log_w.print("zclip daemon: storage directory missing: {s}\n", .{dir_path});
+            try log_w.print("  create it with: mkdir -p {s}\n", .{dir_path});
+            try log_w.flush();
+            return error.MissingStorageDir;
+        },
+        else => return err,
+    };
 
-    const pid_path = try std.fmt.allocPrintSentinel(allocator, "{s}/zclip.pid", .{dir_path}, 0);
+    const pid_path = try std.fmt.allocPrint(allocator, "{s}/zclip.pid", .{dir_path});
     defer allocator.free(pid_path);
 
-    const pid_fd = acquirePidfileSimple(pid_path) catch |err| switch (err) {
-        error.AlreadyRunning => {
+    // On Darwin, `createFile` with `.lock = .exclusive` + `.lock_nonblocking`
+    // acquires the advisory flock atomically with the open(2). `truncate = false`
+    // preserves any existing PID until we overwrite via `writePid`.
+    var pid_file = Io.Dir.cwd().createFile(io, pid_path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => {
             try log_w.writeAll("zclip daemon: another instance is already running\n");
             try log_w.flush();
             return;
         },
         else => return err,
     };
-    defer _ = close(pid_fd);
+    defer pid_file.close(io);
 
     // Write PID into the (already-locked) pidfile so `kill`/`pgrep` can
     // find this daemon.
-    try writePid(pid_fd);
+    try writePid(pid_file, io);
 
+    // SQLite's C API wants `const char *`; keep the sentinel-0 path here.
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/history.db", .{dir_path}, 0);
     defer allocator.free(db_path);
 
@@ -130,7 +117,11 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
     try log_w.flush();
 
     while (running.load(.seq_cst)) {
-        sleepSeconds(poll_interval_sec);
+        // `.awake` clock — pauses during system suspend on macOS so the
+        // daemon doesn't wake on sleep to find a backlog of changeCount diffs.
+        Io.sleep(io, poll_interval, .awake) catch |err| switch (err) {
+            error.Canceled => break,
+        };
         if (!running.load(.seq_cst)) break;
 
         // Per-tick autorelease pool: Obj-C calls below (`stringWithUTF8String:`,
@@ -164,7 +155,7 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
         var hash: [Sha256.digest_length]u8 = undefined;
         Sha256.hash(content, &hash, .{});
 
-        const now: i64 = unixNow();
+        const now: i64 = unixNow(io);
         const inserted = try db.upsertByHash(content, &hash, now);
         if (inserted) {
             try log_w.print("  + new entry ({d} bytes)\n", .{content.len});
@@ -176,19 +167,4 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
 
     try log_w.writeAll("zclip daemon: shutting down\n");
     try log_w.flush();
-}
-
-/// Open the pidfile and grab an exclusive non-blocking flock. Returns
-/// `error.AlreadyRunning` if another process holds the lock.
-fn acquirePidfileSimple(pid_path: [:0]const u8) !c_int {
-    const fd = open(pid_path.ptr, O_WRONLY | O_CREAT, @as(c_uint, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    // errdefer fires only on the error path — caller owns fd on success.
-    errdefer _ = close(fd);
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        // EWOULDBLOCK == EAGAIN == 35 on darwin
-        if (std.c._errno().* == 35) return error.AlreadyRunning;
-        return error.FlockFailed;
-    }
-    return fd;
 }
