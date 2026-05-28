@@ -161,6 +161,10 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
         else => return err,
     };
     defer _ = close(pid_fd);
+
+    // Record this daemon's PID inside the (already locked) pidfile so external
+    // tools like `kill`, `pgrep`, and shell scripts can find the running
+    // daemon by reading the file.
     try writePid(pid_fd);
 
     // ---- Open the database ----
