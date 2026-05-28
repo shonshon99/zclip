@@ -63,6 +63,7 @@ fn sleepSeconds(s: c_long) void {
 
 const clipboard = @import("clipboard.zig");
 const db_mod = @import("db.zig");
+const objc = @import("objc");
 
 const poll_interval_sec: c_long = 1;
 
@@ -184,6 +185,19 @@ pub fn run(allocator: std.mem.Allocator, log_w: anytype) !void {
         sleepSeconds(poll_interval_sec);
         // A signal might have flipped the flag while we were asleep.
         if (!running.load(.seq_cst)) break;
+
+        // Every Obj-C call inside this iteration may allocate autoreleased
+        // objects (NSString from `stringWithUTF8String:`, NSArray from
+        // `[pb types]`, etc.). Without an autorelease pool on this thread,
+        // those objects pile into a process-global pool that never drains.
+        // Push a fresh pool per tick and pop it at end of scope so all
+        // autoreleased temporaries get freed before the next sleep.
+        //
+        // SAFETY: `pb.readString` copies its bytes into the caller's
+        // allocator before returning, so the slice survives `pool.deinit`.
+        // Don't hand any raw NSString-owned pointer past the defer below.
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
 
         const cc = pb.changeCount();
         if (cc == last_change) continue; // nothing happened this tick
