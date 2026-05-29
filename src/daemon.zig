@@ -82,9 +82,15 @@ pub fn run(
     const pid_path = try std.fmt.allocPrint(allocator, "{s}/zclip.pid", .{dir_path});
     defer allocator.free(pid_path);
 
-    // On Darwin, `createFile` with `.lock = .exclusive` + `.lock_nonblocking`
-    // acquires the advisory flock atomically with the open(2). `truncate = false`
-    // preserves any existing PID until we overwrite via `writePid`.
+    // Single-instance gate via flock — an in-memory mutex can't span
+    // processes, so we lock a file both can name; the kernel arbitrates the
+    // shared inode. Any dedicated path works; reusing the pidfile lets one
+    // file serve both the lock and the `kill`/`pgrep` PID readout.
+    //
+    // `.exclusive` + `.lock_nonblocking` takes the flock atomically with
+    // open(2) — no TOCTOU window. `truncate = false` preserves the old PID
+    // until `writePid` overwrites it. OS drops the lock on exit/crash, so no
+    // stale lock blocks a restart.
     var pid_file = Io.Dir.cwd().createFile(io, pid_path, .{
         .truncate = false,
         .lock = .exclusive,

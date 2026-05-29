@@ -112,6 +112,8 @@ pub const Db = struct {
         hash: []const u8,
         now: i64,
     ) Error!bool {
+        // Step 1 — probe by hash, not content. 32-byte indexed compare beats
+        // scanning a possibly-huge TEXT column; this is the dedup key.
         const find_sql = "SELECT id FROM entries WHERE hash = ? LIMIT 1;";
         const find_stmt = try self.prepare(find_sql);
         defer _ = c.sqlite3_finalize(find_stmt);
@@ -124,6 +126,9 @@ pub const Db = struct {
             SQLITE_STATIC,
         ) != c.SQLITE_OK) return Error.BindFailed;
 
+        // Step 2 — hash already present: bump copied_at so re-copied content
+        // resurfaces as most-recent. Return false so the daemon logs a bump,
+        // not a new entry. SQLITE_ROW = match; SQLITE_DONE = none (fall to insert).
         const step_rc = c.sqlite3_step(find_stmt);
         if (step_rc == c.SQLITE_ROW) {
             const existing_id = c.sqlite3_column_int64(find_stmt, 0);
@@ -137,6 +142,9 @@ pub const Db = struct {
             return Error.StepFailed;
         }
 
+        // Step 3 — no match: insert the new entry. Return true so the daemon
+        // logs it as new. Not wrapped in a txn with step 1 — safe only because
+        // the daemon is the sole writer (single-instance via pidfile lock).
         const ins = try self.prepare(
             "INSERT INTO entries (content, hash, copied_at) VALUES (?, ?, ?);",
         );
