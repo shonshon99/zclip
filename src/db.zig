@@ -230,6 +230,7 @@ pub const Db = struct {
                 @as([*]const u8, @ptrCast(text_ptr))[0..text_len],
             ) catch return Error.OutOfMemory;
             const copied_at = c.sqlite3_column_int64(stmt, 2);
+
             out.append(self.allocator, .{
                 .id = id,
                 .content = content,
@@ -245,9 +246,11 @@ pub const Db = struct {
         const stmt = try self.prepare("SELECT content FROM entries WHERE id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return Error.BindFailed;
+
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
+
         const text_ptr = c.sqlite3_column_text(stmt, 0);
         const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         return self.allocator.dupe(
