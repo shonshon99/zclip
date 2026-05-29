@@ -79,9 +79,10 @@ pub const Db = struct {
 
     /// One-off statement (no parameters, no result rows). For pragmas and DDL.
     pub fn exec(self: *Db, sql: []const u8) Error!void {
-        var err: [*c]u8 = null;
         const z = self.allocator.dupeSentinel(u8, sql, 0) catch return Error.OutOfMemory;
         defer self.allocator.free(z);
+
+        var err: [*c]u8 = null;
         const rc = c.sqlite3_exec(self.handle, z.ptr, null, null, &err);
         if (rc != c.SQLITE_OK) {
             if (err != null) c.sqlite3_free(err);
