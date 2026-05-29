@@ -79,7 +79,7 @@ index on hash, index on copied_at
 
 Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
 
-Schema lives inline in `db.zig`. No migration runner yet — introduce one (`PRAGMA user_version` based) before the first column addition. `ROADMAP.md` step 1 (source-app + URL provenance) is the trigger.
+Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction. `ROADMAP.md` step 1 (source-app + URL provenance) is the first consumer.
 
 ## Comment style
 

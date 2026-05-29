@@ -7,6 +7,9 @@
 //! `upsertByHash` updates `copied_at` if the same content has been seen
 //! before (matched by SHA256), otherwise inserts.
 //!
+//! Schema is created/upgraded by the `MIGRATIONS` runner (PRAGMA
+//! user_version) on `open`, not inline — append a migration for any change.
+//!
 //! Bindings come from translate-c run over `src/sqlite_c.h` and wired into
 //! the build as the `sqlite_c` module (see `build.zig`). 0.16 deprecated
 //! source-level `@cImport` in favor of build-system translate-c.
@@ -24,6 +27,26 @@ pub const c = @import("sqlite_c");
 // SQLITE_STATIC semantics hold and we can pass null (SQLite treats null
 // as "caller manages buffer lifetime").
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+
+// Ordered schema migrations. MIGRATIONS[i] is the SQL that upgrades the DB
+// from `user_version` i to i+1; the target version is `MIGRATIONS.len`.
+//
+// Append-only contract: never edit, reorder, or delete an existing entry —
+// each string has already run (and bumped user_version) on live databases,
+// so changing one would silently desync those installs from fresh ones. New
+// schema changes go in a NEW trailing entry. A single entry may hold several
+// `;`-separated statements; sqlite3_exec runs them all.
+const MIGRATIONS = [_][]const u8{
+    // v1 — initial schema (previously executed inline in open()).
+    \\CREATE TABLE IF NOT EXISTS entries (
+    \\  id        INTEGER PRIMARY KEY,
+    \\  content   TEXT NOT NULL,
+    \\  hash      BLOB NOT NULL,
+    \\  copied_at INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS entries_hash_idx ON entries(hash);
+    \\CREATE INDEX IF NOT EXISTS entries_copied_at_idx ON entries(copied_at);
+};
 
 pub const Error = error{
     OpenFailed,
@@ -60,17 +83,47 @@ pub const Db = struct {
         // synchronous=NORMAL: tiny crash-recovery risk for big throughput.
         // Fine for clipboard history.
         try db.exec("PRAGMA synchronous=NORMAL;");
-        try db.exec(
-            \\CREATE TABLE IF NOT EXISTS entries (
-            \\  id        INTEGER PRIMARY KEY,
-            \\  content   TEXT NOT NULL,
-            \\  hash      BLOB NOT NULL,
-            \\  copied_at INTEGER NOT NULL
-            \\);
-        );
-        try db.exec("CREATE INDEX IF NOT EXISTS entries_hash_idx ON entries(hash);");
-        try db.exec("CREATE INDEX IF NOT EXISTS entries_copied_at_idx ON entries(copied_at);");
+
+        // journal_mode/synchronous are per-connection and re-run every open;
+        // schema lives in the versioned migration runner instead. Idempotent,
+        // so CLI invocations that open the DB are safe even before the daemon.
+        try db.migrate();
         return db;
+    }
+
+    /// Read the current `PRAGMA user_version` (0 on a fresh DB).
+    fn userVersion(self: *Db) Error!usize {
+        const stmt = try self.prepare("PRAGMA user_version;");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return Error.StepFailed;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
+    }
+
+    /// Apply every migration above the DB's current `user_version`, each in
+    /// its own transaction, bumping `user_version` after each. No-op when
+    /// already at `MIGRATIONS.len` (idempotent re-runs).
+    fn migrate(self: *Db) Error!void {
+        const current = try self.userVersion();
+        var v: usize = current;
+        while (v < MIGRATIONS.len) : (v += 1) {
+            // IMMEDIATE grabs the write lock up front so a concurrently
+            // opening CLI process can't double-apply the same step on a
+            // fresh DB; ROLLBACK on any failure keeps the step atomic.
+            try self.exec("BEGIN IMMEDIATE;");
+            errdefer self.exec("ROLLBACK;") catch {};
+            try self.exec(MIGRATIONS[v]);
+
+            // user_version can't be bound as a parameter — format the literal.
+            // v+1 is the version this step produces; usize, no injection risk.
+            var buf: [64]u8 = undefined;
+            const sql = std.fmt.bufPrint(
+                &buf,
+                "PRAGMA user_version = {d};",
+                .{v + 1},
+            ) catch return Error.ExecFailed;
+            try self.exec(sql);
+            try self.exec("COMMIT;");
+        }
     }
 
     pub fn close(self: *Db) void {
