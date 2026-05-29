@@ -106,13 +106,16 @@ pub const Pasteboard = struct {
     pub fn writeStringAsOrigin(self: Pasteboard, allocator: std.mem.Allocator, content: []const u8) !void {
         _ = self.pb.msgSend(c_long, "clearContents", .{});
 
-        const content_ns = try nsStringFromSlice(allocator, content);
-        const string_t = nsStringFromCStr(string_type);
-        self.pb.msgSend(void, "setString:forType:", .{ content_ns, string_t });
-
-        // Tag value can be anything non-empty — only the type's presence matters.
+        // Tag before content: each setString bumps changeCount, so the daemon
+        // can poll mid-write. Content-first would expose a {content, no-tag}
+        // item it captures as its own (feedback loop). Tag-first leaves only
+        // skippable transients. Value arbitrary — only the type's presence matters.
         const origin_ns = nsStringFromCStr("1");
         const origin_t = nsStringFromCStr(origin_type);
         self.pb.msgSend(void, "setString:forType:", .{ origin_ns, origin_t });
+
+        const content_ns = try nsStringFromSlice(allocator, content);
+        const string_t = nsStringFromCStr(string_type);
+        self.pb.msgSend(void, "setString:forType:", .{ content_ns, string_t });
     }
 };
