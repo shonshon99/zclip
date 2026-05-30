@@ -37,7 +37,7 @@ const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 // schema changes go in a NEW trailing entry. A single entry may hold several
 // `;`-separated statements; sqlite3_exec runs them all.
 const MIGRATIONS = [_][]const u8{
-    // v1 — initial schema (previously executed inline in open()).
+    // v1 — initial schema
     \\CREATE TABLE IF NOT EXISTS entries (
     \\  id        INTEGER PRIMARY KEY,
     \\  content   TEXT NOT NULL,
@@ -46,6 +46,18 @@ const MIGRATIONS = [_][]const u8{
     \\);
     \\CREATE INDEX IF NOT EXISTS entries_hash_idx ON entries(hash);
     \\CREATE INDEX IF NOT EXISTS entries_copied_at_idx ON entries(copied_at);
+    \\
+    \\CREATE TABLE IF NOT EXISTS tags (
+    \\  id        INTEGER PRIMARY KEY,
+    \\  name      TEXT NOT NULL UNIQUE COLLATE NOCASE
+    \\);
+    \\
+    \\CREATE TABLE IF NOT EXISTS entry_tags (
+    \\  entry_id  INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    \\  tag_id    INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    \\  PRIMARY KEY (entry_id, tag_id)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS entry_tags_tag_idx ON entry_tags(tag_id);
 };
 
 pub const Error = error{
@@ -54,6 +66,7 @@ pub const Error = error{
     BindFailed,
     StepFailed,
     ExecFailed,
+    NotFound,
     OutOfMemory,
 };
 
@@ -83,10 +96,16 @@ pub const Db = struct {
         // synchronous=NORMAL: tiny crash-recovery risk for big throughput.
         // Fine for clipboard history.
         try db.exec("PRAGMA synchronous=NORMAL;");
+        // foreign_keys is per-connection and OFF by default. Required for the
+        // entry_tags ON DELETE CASCADE to fire — without it, deleting an entry
+        // orphans its link rows. Must run before migrate(): the pragma is a
+        // no-op inside a transaction and migrate() opens BEGIN IMMEDIATE.
+        try db.exec("PRAGMA foreign_keys=ON;");
 
-        // journal_mode/synchronous are per-connection and re-run every open;
-        // schema lives in the versioned migration runner instead. Idempotent,
-        // so CLI invocations that open the DB are safe even before the daemon.
+        // journal_mode/synchronous/foreign_keys are per-connection and re-run
+        // every open; schema lives in the versioned migration runner instead.
+        // Idempotent, so CLI invocations that open the DB are safe even before
+        // the daemon.
         try db.migrate();
         return db;
     }
@@ -326,6 +345,49 @@ pub const Db = struct {
             u8,
             @as([*]const u8, @ptrCast(text_ptr))[0..text_len],
         ) catch Error.OutOfMemory;
+    }
+
+    pub fn insertTag(self: *Db, tag: []const u8) Error!void {
+        const stmt = try self.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?);");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(
+            stmt,
+            1,
+            tag.ptr,
+            @intCast(tag.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return Error.StepFailed;
+    }
+
+    pub fn getTagIdByName(self: *Db, tag: []const u8) Error!i64 {
+        const stmt = try self.prepare("SELECT id FROM tags WHERE name = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(
+            stmt,
+            1,
+            tag.ptr,
+            @intCast(tag.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return Error.NotFound;
+        if (rc != c.SQLITE_ROW) return Error.StepFailed;
+
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    pub fn insertEntryTag(self: *Db, entry_id: i64, tag_id: i64) Error!void {
+        const stmt = try self.prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?, ?);");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, entry_id) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 2, tag_id) != c.SQLITE_OK) return Error.BindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return Error.StepFailed;
     }
 };
 
