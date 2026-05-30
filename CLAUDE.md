@@ -3,21 +3,23 @@
 Persistent clipboard history daemon for macOS. Zig + libsqlite3 + NSPasteboard.
 
 This file: what a future Claude session needs to be productive immediately.
-Forward-looking roadmap + Raycast-complement strategy: `ROADMAP.md`.
+Forward-looking roadmap + Raycast-picker strategy: `ROADMAP.md`.
 
 ## Workflow context — READ FIRST
 
-Primary clipboard UX = **Raycast** (history picker + named snippets with dynamic placeholders). Raycast retains ~1 month; snippets are static, content-only.
+**zclip is the primary clipboard store.** The daemon captures every copy and retains it permanently. A Raycast extension (ROADMAP step 3) is the front-end: it searches zclip via `zclip query --json` and pastes the selected entry via `zclip use <id>`, **replacing Raycast's built-in Clipboard History**. zclip owns the data; Raycast is the picker UI on top of it.
 
-**zclip's role: long-term back-of-house archive.** Not a picker. Specializes in what Raycast structurally cannot offer:
+> Strategy reversed 2026-05-30. zclip was previously framed as a "back-of-house archive, not a picker" complementing Raycast's native history. It now backs the picker directly. Disregard older comments/issues implying "do not rebuild Raycast's picker."
+
+What zclip provides over a stock clipboard manager:
 
 - Permanent retention (years, not weeks)
-- Rich metadata captured at copy time (source app, URL provenance, project/cwd) — planned
-- Programmatic CLI access (pipe, query, export)
-- Insights derivable only from long-tail history
-- Safety guarantees that scale with retention (encryption at rest, secret audits)
+- **User tags** on any entry + search/filter by tag (ROADMAP step 1)
+- **Auto-classification** by `kind` (url/code/secret/...) at insert (ROADMAP step 2)
+- Programmatic CLI + JSON access (`query`, `pipe`, `recent`) — powers the Raycast extension and shell pipelines
+- Safety that scales with retention (encryption at rest, secret audits)
 
-Do NOT rebuild Raycast's picker UI. Do NOT compete on snippet expansion. Complement.
+Still out of scope: **snippet *expansion*** (named snippets with dynamic placeholders stay Raycast's job). zclip only *detects* frequently-copied candidates and hands them to Raycast (ROADMAP step 4). Source-app / URL provenance was **dropped** — too sparse (browser-only, NULL for Slack/terminal); user-applied tags replace it.
 
 Build order and deferred features live in `ROADMAP.md`. Update that file when scope shifts.
 
@@ -79,7 +81,7 @@ index on hash, index on copied_at
 
 Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
 
-Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction. `ROADMAP.md` step 1 (source-app + URL provenance) is the first consumer.
+Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction. `ROADMAP.md` step 1 (tags: `tags` + `entry_tags` tables) is the first consumer — note it needs `PRAGMA foreign_keys = ON` (per-connection, off by default) for the join's `ON DELETE CASCADE`.
 
 ## Comment style
 

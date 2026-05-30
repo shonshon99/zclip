@@ -1,150 +1,130 @@
-# zclip Roadmap — Raycast Complement
+# zclip Roadmap — Raycast-backed clipboard manager
 
 ## Workflow context
 
-Primary clipboard UX = **Raycast** (history picker + named snippets with dynamic placeholders).
-Raycast clipboard history is bounded to ~1 month. Raycast snippets are static, content-only.
+**zclip is the primary clipboard store.** The daemon captures every copy and keeps it permanently in SQLite. The front-end is a Raycast extension (step 3) that searches zclip and pastes from it, **replacing Raycast's built-in Clipboard History**. zclip owns the data; Raycast is the picker UI.
 
-**zclip's role: long-term back-of-house archive.** Not a picker. Specializes in what Raycast structurally cannot offer:
+> **Strategy reversed 2026-05-30.** zclip was previously framed as a "back-of-house archive, not a picker" that complemented Raycast's native history, capturing rich source-app/URL provenance Raycast couldn't. That direction is dropped:
+> - Provenance columns (`source_app`/`source_title`/`source_url`) are **out** — sparse (browser-only, NULL for Slack/terminal), bloat per row, no consumer worth the AppleScript cost.
+> - **User-applied tags** replace them as the metadata worth keeping.
+> - The Raycast extension now **is** the picker, backed by `zclip query --json` + `zclip use`.
+
+What zclip provides over a stock clipboard manager:
 
 - Permanent retention (years, not weeks)
-- Rich metadata captured at copy time (source app, URL provenance, project/cwd)
-- Programmatic CLI access (pipe, query, export)
-- Insights derivable only from long-tail history
-- Safety guarantees that matter more as retention grows
+- User tags + tag search
+- Auto-classification by `kind` at insert
+- Programmatic CLI + JSON (queryable dataset, not just a paste buffer)
+- Encryption at rest + secret audits that scale with retention
 
-Do NOT rebuild Raycast's picker UI. Do NOT compete on snippet expansion. Complement.
+Still out of scope: **snippet expansion** (named snippets with dynamic placeholders stay Raycast's). zclip only *detects* snippet candidates (step 4).
 
 ---
 
 ## Recommended build order
 
-Each item below is a milestone. Earlier items unlock later ones (metadata at capture time is a prerequisite for filtered queries, audits, project tags, etc.).
+Each item is a milestone; earlier items unlock later ones. GitHub issues track the detail — numbers below in parentheses.
 
-### 1. Source-app + URL provenance capture
+### 1. Tag entries + search by tag (#2)
 
-**Pain:** Six months later — "where did I copy this from?" Raycast forgets context after eviction.
-
-**Build:**
-- At copy time, capture `NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier` and window title.
-- For Safari/Chrome/Arc, capture active tab URL via AppleScript (`osascript -e`) or Accessibility API.
-- Persist alongside content in `entries`.
-
-**Schema additions:**
-```sql
-ALTER TABLE entries ADD COLUMN source_app TEXT;       -- bundle id, e.g. "com.apple.Safari"
-ALTER TABLE entries ADD COLUMN source_title TEXT;     -- window/tab title at copy time
-ALTER TABLE entries ADD COLUMN source_url TEXT;       -- browser URL when available
-```
-
-`zclip show <id>` displays: `Safari · 2025-08-12 14:32 · https://news.ycombinator.com/item?id=...`.
-
-Foundation for everything below. Start the data accumulating now even before any UI consumes it.
-
-### 2. Annotations + structured query
-
-**Pain:** Archive is one undifferentiated blob. Want to slice by date, source, kind. Want to attach "why" to important entries.
+**Pain:** The archive is one undifferentiated blob. Want to label important entries and recall them by label.
 
 **Build:**
-- `notes` column (free-text, FTS-indexed).
-- `kind` column (heuristic classifier: `url`, `code`, `json`, `email`, `command`, `path`, `secret`, `prose`).
-- CLI:
+- Normalized many-to-many schema (append to the `MIGRATIONS` runner):
+  ```sql
+  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+  CREATE TABLE entry_tags (
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES tags(id)    ON DELETE CASCADE,
+    PRIMARY KEY (entry_id, tag_id)
+  );
+  CREATE INDEX entry_tags_tag_idx ON entry_tags(tag_id);
   ```
-  zclip note <id> "PR #123 review feedback from Alex"
-  zclip query --kind=url --from 2025-12 --source com.slack --format jsonl
-  zclip recent --kind=prose | pbcopy
-  zclip pipe <id> | jq .
-  ```
-- JSON/JSONL output enables `jq`/`fx`/`miller` chains. Becomes a queryable dataset, not just a paste buffer.
+  `PRAGMA foreign_keys = ON` is per-connection and OFF by default — set it in `Db.open` or the cascades won't fire.
+- CLI: `zclip tag <id> <tag>...`, `zclip untag <id> <tag>...`, `zclip tags`.
+- `zclip search --tag <name>` (repeatable, AND semantics), composes with keyword match. Output appends `· #tags`.
 
-**Schema:**
-```sql
-ALTER TABLE entries ADD COLUMN note TEXT;
-ALTER TABLE entries ADD COLUMN kind TEXT;             -- classifier output
-CREATE INDEX IF NOT EXISTS entries_kind_idx ON entries(kind);
-CREATE INDEX IF NOT EXISTS entries_source_app_idx ON entries(source_app);
-```
+### 2. Classify entries by kind on insert (#3)
 
-### 3. Raycast extension: "Search zclip" + "Archive to zclip"
-
-**Pain:** Don't want a separate keybind or picker for the long tail. Stay in Raycast muscle memory.
+**Pain:** Want a coarse machine-assigned type so the archive is sliceable and secrets are detectable without manual tagging.
 
 **Build:**
-- Raycast extension (TypeScript) with two commands:
-  - **Archive to zclip** — action on a Raycast history item. Shells out to `zclip archive --tag <tag> --note <note>` to permanently retain (and annotate) before Raycast evicts.
-  - **Search zclip** — text input → calls `zclip query --json` → renders results. Actions: "Copy", "Paste", "Show details", "Open source URL".
-- Raycast picker becomes a unified front for both the 30-day cache (native) and the multi-year archive (zclip-backed).
+- `kind` column + index. Heuristic classifier `src/classify.zig`: `secret`, `url`, `json`, `code`, `email`, `path`, `command`, `prose` (strict precedence, first match wins; secret first).
+- Daemon classifies before insert. `zclip search` output appends `· kind=<kind>`.
+- Feeds the `secret` exclusion in step 4 and the audit in step 6.
 
-### 4. Snippet candidate detector + Raycast Quicklink integration
+### 3. Raycast extension — zclip-backed picker, replaces Clipboard History (#7)
 
-**Pain:** You copy the same kubectl/SSH/regex block 50× over months but never notice it should be a snippet.
-
-**Build:**
-- `zclip suggest-snippets` analyzes archive: normalize whitespace, hash, group identical/near-identical strings, rank by frequency × recency.
-- Output:
-  ```
-  47×  kubectl --context prod get pods -n foo
-  31×  ssh -J bastion.acme.com prod-app-01
-  22×  (^|\s)(\S+@\S+\.\S+)(\s|$)
-  ```
-- For each, emit a Raycast Quicklink URL (`raycast://extensions/raycast/snippets/create-snippet?text=...&name=...`) — one click promotes to Raycast snippet.
-- zclip *teaches* you what to promote. Closes the loop between archive and Raycast snippets.
-
-### 5. FTS5 + Core Spotlight indexing
-
-**Pain:** `LIKE '%x%'` over years of data gets slow. Don't want yet another picker keybind for old archive.
+**Pain:** Want the permanent archive reachable in Raycast muscle memory, not a separate keybind.
 
 **Build:**
-- Migrate to SQLite FTS5 virtual table on `content + note + source_title`. (Schema migration runner first — see Known Tradeoffs in `zclip-handoff.md`.)
-- Index entries into macOS Core Spotlight via `CSSearchableItemAttributeSet`. Cmd-Space → system-wide hit on year-old clipboard. Zero new keybinds, taps existing search habit.
+- TypeScript Raycast extension, **Search zclip** command: text input → `zclip query --json` (step 5) → list view, as-you-type filter.
+- Per-item actions: **Paste/Copy** (`zclip use <id>` writes to pasteboard — already implemented), **Show details**, **Copy tags**.
+- README documents disabling Raycast's native Clipboard History so the two don't double-capture.
+- Tagging/managing stays CLI-only for v1 (search + paste-back is the surface).
 
-### 6. Encryption at rest + retroactive secret audit + encrypted backup
+### 4. Snippet candidate detector (#8)
 
-**Pain:** Long retention amplifies risk. Year-old API keys sitting in plaintext SQLite = bad. Laptop loss = lose entire multi-year archive.
-
-**Build:**
-- **Encryption at rest:** SQLCipher (drop-in libsqlite3 replacement) OR app-layer AES-GCM on `content` + `note` columns. Key in macOS Keychain via `Security.framework` (`SecItemCopyMatching`). Daemon unlocks on launch — no passphrase friction.
-- **`zclip audit secrets`:** Regex-scan entire archive for `aws_secret`, `jwt`, `bearer`, `ghp_`, `sk-`, PEM blocks, credit-card Luhn. Lists with masked preview. `--purge` removes. Run on schedule.
-- **Encrypted backup:** Nightly `zclip backup` → age-encrypted SQLite dump pushed to S3/iCloud Drive/git LFS. `zclip restore <url>` on new machine. Disaster recovery as first-class workflow.
-
-### 7. Semantic search (`sqlite-vss` + local embeddings)
-
-**Pain:** "That AWS throttling error I copied last summer" — no exact keyword match. FTS5 won't catch paraphrases.
+**Pain:** You copy the same kubectl/SSH/regex block dozens of times but never notice it should be a snippet.
 
 **Build:**
-- Local embedding model (BGE-small, ~30MB, CoreML-optimized) embeds entries on insert.
-- Store vectors in `sqlite-vss` extension table.
-- `zclip ask "aws rate limit error from spring"` → top-k cosine matches.
-- Moat feature. Structurally impossible for Raycast (30-day cache, no embeddings).
+- `zclip suggest-snippets`: normalize whitespace, hash, group identical-after-normalization, rank by frequency × recency.
+- Skip `kind = secret` (from step 2). Emit a Raycast Quicklink (`raycast://extensions/raycast/snippets/create-snippet?...`) per candidate — one click promotes to a Raycast snippet. zclip *teaches* Raycast what to remember; expansion stays Raycast's.
+
+### 5. Structured query CLI (#5)
+
+**Pain:** Want the archive as a queryable dataset and the JSON feed the Raycast extension consumes.
+
+**Build:**
+- `zclip query` with `--kind`, `--tag` (AND), `--from`/`--to`, `--limit`, `--format human|jsonl|json`.
+- `zclip pipe <id>` (raw content to stdout), `zclip recent --kind <k>`.
+- JSON/JSONL enables `jq`/`fx` chains **and** backs step 3's Search command. (Land the query JSON before/with the extension.)
+
+### 6. FTS5 full-text search (#9)
+
+**Pain:** `LIKE '%x%'` over years of data gets slow; search is now the primary interaction.
+
+**Build:**
+- SQLite FTS5 virtual table over `content`. Migrate `zclip search` off `LIKE`. (Migration runner already in place — #1, done.)
+
+### 7. Encryption at rest + secret audit + encrypted backup (#11, #12, #13)
+
+**Pain:** Long retention amplifies risk — year-old API keys in plaintext SQLite; laptop loss = lose the whole archive.
+
+**Build:**
+- **Encryption at rest (#11):** SQLCipher or app-layer AES-GCM on `content`. Key in macOS Keychain (`Security.framework`). Daemon unlocks on launch.
+- **`zclip audit secrets` (#12):** regex-scan the archive (reuses step 2's `secret` patterns), masked preview, `--purge`.
+- **Encrypted backup/restore (#13):** `zclip backup` → encrypted dump; `zclip restore`. Disaster recovery as first-class workflow.
+
+### 8. Semantic search (#14)
+
+**Pain:** "That AWS throttling error I copied last summer" — no exact keyword match; FTS5 misses paraphrases.
+
+**Build:**
+- Local embedding model embeds entries on insert; vectors in `sqlite-vss`. `zclip ask "..."` → top-k cosine matches.
 
 ---
 
-## Deferred (not in current build order)
+## Deferred follow-ups
 
-Listed for completeness; revisit only if pain shows up:
+- **Per-app deny rules (#6)** — `~/.config/zclip/rules.toml` blocklist of bundle ids. Daemon reads the **frontmost app bundle id transiently** at copy time (`NSWorkspace.frontmostApplication`) and skips insert on a match — no stored column. Defense in depth over the `ConcealedType` filter. Land after steps 1–3 are stable.
 
-- **Image clipboard + OCR** — Raycast already handles image history acceptably for the 30-day window.
-- **Stack paste / multi-cursor** — niche; Raycast covers most multi-paste workflows.
-- **Transform pipeline on paste** — Raycast snippet placeholders cover the common case.
-- **Cross-device sync** — Raycast Pro sync handles short-term; address only if multi-year multi-device archive becomes a clear pain.
-- **Diff between revisions of same content** — interesting but no acute pain.
-- **Shell-history correlation** — powerful for retroactive debugging but invasive (requires zsh/fish hooks).
+## Deferred (revisit only if pain shows up)
 
----
-
-## Cross-cutting prerequisites
-
-Before items 2+ land cleanly, two pieces of plumbing are worth introducing:
-
-1. **Migration runner** — `PRAGMA user_version` based. Schema lives in numbered `.sql` files (or inline `const MIGRATIONS = .{ ... }`). Daemon runs pending migrations on startup. Current schema lives inline in `db.zig`; once column #2 lands, do this first.
-2. **Per-app rules config** — `~/.config/zclip/rules.toml` with `deny.bundle_ids = [...]`. Daemon checks `frontmostApplication` (already needed for #1) before insert. Defense in depth on top of `ConcealedType` filter.
+- **Image clipboard + OCR** — text-first for now.
+- **Stack paste / multi-cursor** — niche.
+- **Transform pipeline on paste**.
+- **Cross-device sync** — only if multi-year multi-device archive becomes a clear pain.
+- **Diff between revisions of same content**.
+- **Shell-history correlation** — powerful but invasive (zsh/fish hooks).
+- **Freeform notes on entries** — was a planned feature (old #4), dropped in favor of tags; revive only if tags prove insufficient.
 
 ---
 
-## Design principles (carried forward from handoff)
+## Design principles
 
 - Local-first. Single SQLite file the user fully owns.
-- Daemon stays minimal: poll, classify, insert. Heavy work (embeddings, OCR, audits) runs in CLI subcommands or background workers triggered out-of-band.
+- Daemon stays minimal: poll, classify, insert. Heavy work (embeddings, audits, suggest-snippets) runs in CLI subcommands triggered out-of-band.
 - WAL mode. CLI reads never block daemon writes.
-- Don't strip the `dev.zclip.origin` feedback-loop marker or the `ConcealedType` filter — both are load-bearing.
-- Schema changes go through the migration runner once introduced. Document each migration in this file when added.
+- Don't strip the `dev.zclip.origin` feedback-loop marker or the `ConcealedType` filter — both load-bearing.
+- Schema changes go through the `MIGRATIONS` runner (`db.zig`) — append-only, never edit a shipped entry. Document each migration here when added.
