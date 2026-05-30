@@ -103,14 +103,30 @@ pub const Db = struct {
     /// its own transaction, bumping `user_version` after each. No-op when
     /// already at `MIGRATIONS.len` (idempotent re-runs).
     fn migrate(self: *Db) Error!void {
-        const current = try self.userVersion();
-        var v: usize = current;
-        while (v < MIGRATIONS.len) : (v += 1) {
-            // IMMEDIATE grabs the write lock up front so a concurrently
-            // opening CLI process can't double-apply the same step on a
-            // fresh DB; ROLLBACK on any failure keeps the step atomic.
+        // Cheap unlocked pre-check: the common case (DB already current, hit
+        // by every CLI open) skips the write lock entirely.
+        if (try self.userVersion() >= MIGRATIONS.len) return;
+
+        // Re-check the version *inside* each transaction. The pre-check above
+        // is unlocked, so a concurrent opener could advance user_version
+        // between it and BEGIN IMMEDIATE. Reading under the write lock makes
+        // check-then-apply atomic: the process that loses the BEGIN IMMEDIATE
+        // race sees the bumped version and won't re-run a (possibly
+        // non-idempotent) step.
+        while (true) {
+            // IMMEDIATE grabs the write lock up front so only one process
+            // applies a step; ROLLBACK on any failure keeps the step atomic.
             try self.exec("BEGIN IMMEDIATE;");
             errdefer self.exec("ROLLBACK;") catch {};
+
+            const v = try self.userVersion();
+            if (v >= MIGRATIONS.len) {
+                // Nothing left (we won nothing, or another process did the
+                // work while we waited for the lock). Release and stop.
+                try self.exec("COMMIT;");
+                break;
+            }
+
             try self.exec(MIGRATIONS[v]);
 
             // user_version can't be bound as a parameter — format the literal.
