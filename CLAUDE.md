@@ -2,26 +2,24 @@
 
 Persistent clipboard history daemon for macOS. Zig + libsqlite3 + NSPasteboard.
 
-This file: what a future Claude session needs to be productive immediately.
-Forward-looking roadmap + Raycast-picker strategy: `ROADMAP.md`.
+This file: what a future Claude session needs to be productive immediately —
+over-arching project facts grounded in the source. Forward-looking plans live in
+the issue tracker, not here.
 
-## Workflow context — READ FIRST
+## What zclip is
 
-**zclip is the primary clipboard store.** The daemon captures every copy and retains it permanently. A Raycast extension (ROADMAP step 3) is the front-end: it searches zclip via `zclip query --json` and pastes the selected entry via `zclip use <id>`, **replacing Raycast's built-in Clipboard History**. zclip owns the data; Raycast is the picker UI on top of it.
-
-> Strategy reversed 2026-05-30. zclip was previously framed as a "back-of-house archive, not a picker" complementing Raycast's native history. It now backs the picker directly. Disregard older comments/issues implying "do not rebuild Raycast's picker."
+zclip is a permanent clipboard store. The daemon polls NSPasteboard and inserts
+every copy into a single SQLite file the user owns, retaining it indefinitely (no
+auto-eviction). Duplicate content is deduped by hash and its `copied_at` bumped.
+Entries carry user-assigned tags. The CLI (`daemon`, `search`, `use`, `tag`)
+exposes the archive; `use` writes an entry back to the pasteboard, so zclip can
+back an external picker that searches the archive and pastes a chosen entry.
 
 What zclip provides over a stock clipboard manager:
 
-- Permanent retention (years, not weeks)
-- **User tags** on any entry + search/filter by tag (ROADMAP step 1)
-- **Auto-classification** by `kind` (url/code/secret/...) at insert (ROADMAP step 2)
-- Programmatic CLI + JSON access (`query`, `pipe`, `recent`) — powers the Raycast extension and shell pipelines
-- Safety that scales with retention (encryption at rest, secret audits)
-
-Still out of scope: **snippet *expansion*** (named snippets with dynamic placeholders stay Raycast's job). zclip only *detects* frequently-copied candidates and hands them to Raycast (ROADMAP step 4). Source-app / URL provenance was **dropped** — too sparse (browser-only, NULL for Slack/terminal); user-applied tags replace it.
-
-Build order and deferred features live in `ROADMAP.md`. Update that file when scope shifts.
+- Permanent retention (years, not weeks).
+- User tags on any entry.
+- A single local SQLite file the user fully owns, queryable directly.
 
 ## Commands
 
@@ -29,16 +27,28 @@ Build order and deferred features live in `ROADMAP.md`. Update that file when sc
 zig build                 # produces zig-out/bin/zclip
 zig build run -- daemon   # run daemon via build system
 ./zig-out/bin/zclip daemon
-./zig-out/bin/zclip search <keyword>
-./zig-out/bin/zclip use <id>
+./zig-out/bin/zclip search <keyword>   # LIKE keyword match over content
+./zig-out/bin/zclip use <id>           # rewrite entry to the pasteboard
+./zig-out/bin/zclip tag <id> <tag>     # attach one tag to an entry (lowercased)
 ```
 
 DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/zclip.pid`.
 
+### Functional tests
+
+```
+./tests/run_all.sh          # all suites (tag, search, use, daemon)
+./tests/run_all.sh --safe   # skip clipboard-touching suites (use, daemon) — for CI
+```
+
+Each suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d` so the
+real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes that temp
+HOME. One throwaway HOME per suite.
+
 ## Layout
 
 ```
-src/main.zig       CLI router, search/use commands, ISO timestamp formatting
+src/main.zig       CLI router, search/use/tag commands, ISO timestamp formatting
 src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
 src/db.zig         SQLite wrapper (translate-c on src/sqlite_c.h)
 src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
@@ -46,6 +56,9 @@ src/sqlite_c.h     Shim header — `#include <sqlite3.h>` for build-system trans
 build.zig          translate-c sqlite3, link AppKit/Foundation; link_libc
 build.zig.zon      minimum_zig_version = "0.16.0"
 .zigversion        0.16.0
+tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
+tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
+tests/*_test.sh    Per-command suites: tag, search, use, daemon
 ```
 
 ## Zig version
@@ -68,27 +81,42 @@ Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-gen
 
 **Origin marker prevents daemon feedback loop.** `zclip use` writes content tagged with custom type `dev.zclip.origin`. Daemon's poll checks `pb.hasOrigin()` and skips. Don't strip this from `writeStringAsOrigin`.
 
-**Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext. This is defense-in-depth only — apps that don't set the type (Slack, browsers pasting from docs) bypass it. Long-term mitigation is encryption at rest + retroactive secret audit (`ROADMAP.md` step 6).
+**Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext. This is defense-in-depth only — apps that don't set the type (Slack, browsers pasting from docs) bypass it.
 
 **WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
 
 ## Schema
 
 ```sql
+-- v1
 entries(id INTEGER PK, content TEXT, hash BLOB, copied_at INTEGER)
 index on hash, index on copied_at
+-- v2 (tags)
+tags(id INTEGER PK, name TEXT UNIQUE COLLATE NOCASE)
+entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))
+  both FKs ON DELETE CASCADE; index on tag_id
 ```
 
 Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
 
-Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction. `ROADMAP.md` step 1 (tags: `tags` + `entry_tags` tables) is the first consumer — note it needs `PRAGMA foreign_keys = ON` (per-connection, off by default) for the join's `ON DELETE CASCADE`.
+Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction.
+
+**`PRAGMA foreign_keys=ON` is load-bearing for `entry_tags`.** It's per-connection and OFF by default, so `Db.open` runs it *before* `migrate()` (the pragma is a no-op inside the migration runner's `BEGIN IMMEDIATE`). Without it, deleting an entry orphans its `entry_tags` rows instead of cascading. Don't move or drop this.
 
 ## Comment style
 
-Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those. All source files trimmed 2026-05-28.
+Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those.
 
 ## Known tradeoffs
 
-- **DB growth is unbounded by design.** Permanent retention is the value proposition vs. Raycast. Pruning via raw SQL is always available; auto-eviction intentionally not implemented.
-- **Plaintext at rest.** Concealed-type filter catches password-manager copies, but anything not flagged (API keys pasted from docs, tokens in terminal output) ends up readable on disk. FileVault covers stolen-laptop threat; same-account access still sees plaintext. Mitigation tracked in `ROADMAP.md` step 6.
+- **DB growth is unbounded by design.** Permanent retention is the value proposition. Pruning via raw SQL is always available; auto-eviction intentionally not implemented.
+- **Plaintext at rest.** Concealed-type filter catches password-manager copies, but anything not flagged (API keys pasted from docs, tokens in terminal output) ends up readable on disk. FileVault covers the stolen-laptop threat; same-account access still sees plaintext.
 - **Polling latency.** 1-second poll loses copies made and overwritten inside the gap. macOS exposes no public pasteboard-change notification — polling is the standard approach across clipboard tools.
+
+## Design principles
+
+- Local-first. Single SQLite file the user fully owns.
+- Daemon stays minimal: poll and insert. Heavy work runs in CLI subcommands triggered out-of-band.
+- WAL mode — CLI reads never block daemon writes.
+- `dev.zclip.origin` marker and `ConcealedType` filter are both load-bearing — don't strip (see gotchas).
+- Schema changes go through the `MIGRATIONS` runner — append-only, never edit a shipped entry.

@@ -75,6 +75,37 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     }
+    if (std.mem.eql(u8, cmd, "tag")) {
+        if (args.len < 3) {
+            try err.writeAll("zclip tag: missing <id>\n");
+            try err.flush();
+            std.process.exit(2);
+        } else if (args.len < 4) {
+            try err.writeAll("zclip tag: missing <tag>\n");
+            try err.flush();
+            std.process.exit(2);
+        }
+
+        const id = std.fmt.parseInt(i64, args[2], 10) catch {
+            try err.print("zclip tag: invalid id {s}\n", .{args[2]});
+            try err.flush();
+            std.process.exit(2);
+        };
+
+        const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
+        if (trimmed.len == 0) {
+            try err.print("zclip tag: invalid tag {s}\n", .{args[3]});
+            try err.flush();
+            std.process.exit(2);
+        }
+
+        const buf = try alloc.alloc(u8, trimmed.len);
+        const tag = std.ascii.lowerString(buf, trimmed);
+
+        try runTag(alloc, environ, err, id, tag);
+
+        return;
+    }
 
     try err.writeAll(usage);
     try err.flush();
@@ -144,6 +175,32 @@ fn runUse(
     try pb.writeStringAsOrigin(allocator, content);
     try db.touch(id, daemon.unixNow(io));
     try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, content.len });
+}
+
+fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anytype, entry_id: i64, tag: []const u8) !void {
+    const path = try dbPath(allocator, environ);
+    defer allocator.free(path);
+
+    var db = try db_mod.Db.open(allocator, path);
+    defer db.close();
+
+    db.insertTag(tag) catch |e| {
+        try err.print("{s} - Failed to insert tag {s}\n", .{ @errorName(e), tag });
+        try err.flush();
+        std.process.exit(1);
+    };
+
+    const tag_id = db.getTagIdByName(tag) catch |e| {
+        try err.print("{s} - Failed to get tag id for tag {s}\n", .{ @errorName(e), tag });
+        try err.flush();
+        std.process.exit(1);
+    };
+
+    db.insertEntryTag(entry_id, tag_id) catch |e| {
+        try err.print("{s} - Failed to insert entry tag for entry_id {d} and tag_id {d}\n: ", .{ @errorName(e), entry_id, tag_id });
+        try err.flush();
+        std.process.exit(1);
+    };
 }
 
 // Truncate to `max` bytes; collapse newlines/tabs to spaces so each
