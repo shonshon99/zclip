@@ -106,6 +106,37 @@ pub fn main(init: std.process.Init) !void {
 
         return;
     }
+    if (std.mem.eql(u8, cmd, "untag")) {
+        if (args.len < 3) {
+            try err.writeAll("zclip untag: missing <id>\n");
+            try err.flush();
+            std.process.exit(2);
+        } else if (args.len < 4) {
+            try err.writeAll("zclip untag: missing <tag>\n");
+            try err.flush();
+            std.process.exit(2);
+        }
+
+        const id = std.fmt.parseInt(i64, args[2], 10) catch {
+            try err.print("zclip untag: invalid id {s}\n", .{args[2]});
+            try err.flush();
+            std.process.exit(2);
+        };
+
+        const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
+        if (trimmed.len == 0) {
+            try err.print("zclip untag: invalid tag {s}\n", .{args[3]});
+            try err.flush();
+            std.process.exit(2);
+        }
+
+        const buf = try alloc.alloc(u8, trimmed.len);
+        const tag = std.ascii.lowerString(buf, trimmed);
+
+        try runUntag(alloc, environ, err, id, tag);
+
+        return;
+    }
 
     try err.writeAll(usage);
     try err.flush();
@@ -190,14 +221,29 @@ fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anyty
         std.process.exit(1);
     };
 
-    const tag_id = db.getTagIdByName(tag) catch |e| {
-        try err.print("{s} - Failed to get tag id for tag {s}\n", .{ @errorName(e), tag });
+    const tag_id = try db.getTagIdByName(tag) orelse {
+        try err.print("Failed to get tag id for tag {s}\n", .{tag});
         try err.flush();
         std.process.exit(1);
     };
 
     db.insertEntryTag(entry_id, tag_id) catch |e| {
-        try err.print("{s} - Failed to insert entry tag for entry_id {d} and tag_id {d}\n: ", .{ @errorName(e), entry_id, tag_id });
+        try err.print("{s} - Failed to insert entry tag for entry_id {d} and tag_id {d}\n", .{ @errorName(e), entry_id, tag_id });
+        try err.flush();
+        std.process.exit(1);
+    };
+}
+
+fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anytype, entry_id: i64, tag: []const u8) !void {
+    const path = try dbPath(allocator, environ);
+    defer allocator.free(path);
+
+    var db = try db_mod.Db.open(allocator, path);
+    defer db.close();
+
+    const tag_id = try db.getTagIdByName(tag) orelse return;
+    db.deleteEntryTag(entry_id, tag_id) catch |e| {
+        try err.print("{s} - Failed to delete entry tag for entry_id {d} and tag_id {d}\n", .{ @errorName(e), entry_id, tag_id });
         try err.flush();
         std.process.exit(1);
     };

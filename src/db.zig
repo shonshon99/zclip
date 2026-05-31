@@ -66,7 +66,6 @@ pub const Error = error{
     BindFailed,
     StepFailed,
     ExecFailed,
-    NotFound,
     OutOfMemory,
 };
 
@@ -362,7 +361,7 @@ pub const Db = struct {
         if (rc != c.SQLITE_DONE) return Error.StepFailed;
     }
 
-    pub fn getTagIdByName(self: *Db, tag: []const u8) Error!i64 {
+    pub fn getTagIdByName(self: *Db, tag: []const u8) Error!?i64 {
         const stmt = try self.prepare("SELECT id FROM tags WHERE name = ?;");
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(
@@ -374,7 +373,7 @@ pub const Db = struct {
         ) != c.SQLITE_OK) return Error.BindFailed;
 
         const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) return Error.NotFound;
+        if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
         return c.sqlite3_column_int64(stmt, 0);
@@ -382,6 +381,16 @@ pub const Db = struct {
 
     pub fn insertEntryTag(self: *Db, entry_id: i64, tag_id: i64) Error!void {
         const stmt = try self.prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?, ?);");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, entry_id) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 2, tag_id) != c.SQLITE_OK) return Error.BindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return Error.StepFailed;
+    }
+
+    pub fn deleteEntryTag(self: *Db, entry_id: i64, tag_id: i64) Error!void {
+        const stmt = try self.prepare("DELETE FROM entry_tags WHERE entry_id = ? AND tag_id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_int64(stmt, 1, entry_id) != c.SQLITE_OK) return Error.BindFailed;
         if (c.sqlite3_bind_int64(stmt, 2, tag_id) != c.SQLITE_OK) return Error.BindFailed;
