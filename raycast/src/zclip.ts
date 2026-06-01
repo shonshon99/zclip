@@ -14,7 +14,9 @@ export interface Entry {
 }
 
 export function binaryPath(): string {
-  return getPreferenceValues<Preferences>().binaryPath || "/usr/local/bin/zclip";
+  return (
+    getPreferenceValues<Preferences>().binaryPath || "/usr/local/bin/zclip"
+  );
 }
 
 // One-shot read of the whole archive. zclip does no server-side text search; we

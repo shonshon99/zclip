@@ -20,24 +20,43 @@ const ALL_TAGS = "__all__";
 // One free-text form serves both tag and untag. The name is typed (not picked
 // from a list) because the operations take an arbitrary name: add may create a
 // brand-new tag, and remove may target a tag not in the current filtered set.
-function TagForm({ entry, mode, onMutated }: { entry: Entry; mode: "add" | "remove"; onMutated: () => void }) {
+function TagForm({
+  entry,
+  mode,
+  onMutated,
+}: {
+  entry: Entry;
+  mode: "add" | "remove";
+  onMutated: () => void;
+}) {
   const { pop } = useNavigation();
   const verb = mode === "add" ? "Add Tag" : "Remove Tag";
 
   async function submit(values: { name: string }) {
     const name = values.name.trim();
     if (!name) {
-      await showToast({ style: Toast.Style.Failure, title: "Tag name is empty" });
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Tag name is empty",
+      });
       return;
     }
     try {
       await (mode === "add" ? tag : untag)(entry.id, name);
       const past = mode === "add" ? "Tagged" : "Untagged";
-      await showToast({ style: Toast.Style.Success, title: `${past} #${entry.id}`, message: name });
+      await showToast({
+        style: Toast.Style.Success,
+        title: `${past} #${entry.id}`,
+        message: name,
+      });
       onMutated(); // refresh dropdown + entries in the parent list
       pop();
     } catch (err) {
-      await showToast({ style: Toast.Style.Failure, title: `Failed to ${verb.toLowerCase()}`, message: String(err) });
+      await showToast({
+        style: Toast.Style.Failure,
+        title: `Failed to ${verb.toLowerCase()}`,
+        message: String(err),
+      });
     }
   }
 
@@ -65,7 +84,9 @@ export default function Command() {
 
   // (Re)load the tag list for the dropdown.
   useEffect(() => {
-    tags().then(setTagList).catch(() => undefined);
+    tags()
+      .then(setTagList)
+      .catch(() => undefined);
   }, [revision]);
 
   // Re-fetch entries whenever the selected tag changes — this is the only
@@ -102,7 +123,11 @@ export default function Command() {
       isLoading={loading}
       searchBarPlaceholder="Search clipboard history…"
       searchBarAccessory={
-        <List.Dropdown tooltip="Filter by tag" value={selectedTag} onChange={setSelectedTag}>
+        <List.Dropdown
+          tooltip="Filter by tag"
+          value={selectedTag}
+          onChange={setSelectedTag}
+        >
           <List.Dropdown.Item title="All tags" value={ALL_TAGS} />
           {tagList.map((t) => (
             <List.Dropdown.Item key={t} title={t} value={t} />
@@ -110,6 +135,19 @@ export default function Command() {
         </List.Dropdown>
       }
     >
+      <List.EmptyView
+        icon={Icon.Clipboard}
+        title={
+          selectedTag === ALL_TAGS
+            ? "No clipboard entries"
+            : `No entries tagged "${selectedTag}"`
+        }
+        description={
+          selectedTag === ALL_TAGS
+            ? "Copy something or start the zclip daemon to populate the archive."
+            : "Try a different tag or clear the filter."
+        }
+      />
       {entries.map((entry) => (
         <List.Item
           key={entry.id}
@@ -117,18 +155,33 @@ export default function Command() {
           actions={
             <ActionPanel>
               <Action title="Paste" onAction={() => paste(entry)} />
-              <Action.CopyToClipboard title="Copy to Clipboard" content={entry.content} />
+              <Action.CopyToClipboard
+                title="Copy to Clipboard"
+                content={entry.content}
+              />
               <Action.Push
                 title="Add Tag"
                 icon={Icon.Tag}
                 shortcut={{ modifiers: ["cmd"], key: "t" }}
-                target={<TagForm entry={entry} mode="add" onMutated={() => setRevision((r) => r + 1)} />}
+                target={
+                  <TagForm
+                    entry={entry}
+                    mode="add"
+                    onMutated={() => setRevision((r) => r + 1)}
+                  />
+                }
               />
               <Action.Push
                 title="Remove Tag"
                 icon={Icon.Tag}
                 shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
-                target={<TagForm entry={entry} mode="remove" onMutated={() => setRevision((r) => r + 1)} />}
+                target={
+                  <TagForm
+                    entry={entry}
+                    mode="remove"
+                    onMutated={() => setRevision((r) => r + 1)}
+                  />
+                }
               />
             </ActionPanel>
           }
