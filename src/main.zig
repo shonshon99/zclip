@@ -127,13 +127,15 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         }
+
         // Only `--tag <name>` is accepted: exactly one flag taking one value.
-        // A comma-separated value is one literal tag name, not a list (#5).
         if (args.len == 4 and std.mem.eql(u8, args[2], "--tag")) {
-            try runQuery(alloc, environ, out, args[3]);
+            // Trim to match stored names: tag/untag trim before insert
+            try runQuery(alloc, environ, out, std.mem.trim(u8, args[3], " \t\r\n"));
             try out.flush();
             return;
         }
+
         try err.writeAll("zclip query: usage: zclip query [--tag <name>]\n");
         try err.flush();
         std.process.exit(2);
