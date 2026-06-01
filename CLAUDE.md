@@ -11,9 +11,10 @@ the issue tracker, not here.
 zclip is a permanent clipboard store. The daemon polls NSPasteboard and inserts
 every copy into a single SQLite file the user owns, retaining it indefinitely (no
 auto-eviction). Duplicate content is deduped by hash and its `copied_at` bumped.
-Entries carry user-assigned tags. The CLI (`daemon`, `search`, `use`, `tag`)
-exposes the archive; `use` writes an entry back to the pasteboard, so zclip can
-back an external picker that searches the archive and pastes a chosen entry.
+Entries carry user-assigned tags. The CLI (`daemon`, `query`, `use`, `tag`,
+`untag`) exposes the archive; `query` dumps entries as JSON and `use` writes an
+entry back to the pasteboard, so zclip can back an external picker that loads the
+archive, filters it client-side, and pastes a chosen entry.
 
 What zclip provides over a stock clipboard manager:
 
@@ -27,9 +28,11 @@ What zclip provides over a stock clipboard manager:
 zig build                 # produces zig-out/bin/zclip
 zig build run -- daemon   # run daemon via build system
 ./zig-out/bin/zclip daemon
-./zig-out/bin/zclip search <keyword>   # LIKE keyword match over content
+./zig-out/bin/zclip query              # dump all entries as JSON (newest-first)
+./zig-out/bin/zclip query --tag <name> # filter to entries carrying one tag
 ./zig-out/bin/zclip use <id>           # rewrite entry to the pasteboard
 ./zig-out/bin/zclip tag <id> <tag>     # attach one tag to an entry (lowercased)
+./zig-out/bin/zclip untag <id> <tag>   # remove one tag from an entry
 ```
 
 DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/zclip.pid`.
@@ -37,7 +40,7 @@ DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/
 ### Functional tests
 
 ```
-./tests/run_all.sh          # all suites (tag, search, use, daemon)
+./tests/run_all.sh          # all suites (tag, untag, query, use, daemon)
 ./tests/run_all.sh --safe   # skip clipboard-touching suites (use, daemon) — for CI
 ```
 
@@ -48,7 +51,7 @@ HOME. One throwaway HOME per suite.
 ## Layout
 
 ```
-src/main.zig       CLI router, search/use/tag commands, ISO timestamp formatting
+src/main.zig       CLI router, query/use/tag/untag commands, JSON + ISO timestamp formatting
 src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
 src/db.zig         SQLite wrapper (translate-c on src/sqlite_c.h)
 src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
@@ -58,7 +61,7 @@ build.zig.zon      minimum_zig_version = "0.16.0"
 .zigversion        0.16.0
 tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
 tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
-tests/*_test.sh    Per-command suites: tag, search, use, daemon
+tests/*_test.sh    Per-command suites: tag, untag, query, use, daemon
 ```
 
 ## Zig version
