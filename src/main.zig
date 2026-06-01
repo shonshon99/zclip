@@ -19,9 +19,8 @@ const usage =
     \\
 ;
 
-// Subcommands. `stringToEnum` maps argv[1] to a variant, so dispatch is one
-// exhaustive switch instead of an `eql` chain — adding a command is a compile
-// error until the switch handles it.
+// Commands. Dispatch is one exhaustive switch over the parsed enum,
+// a new variant won't compile until the switch handles it.
 const Command = enum { daemon, use, query, tag, untag };
 
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
@@ -152,15 +151,13 @@ fn runQuery(
         try db.getEntries();
     defer db_mod.freeEntries(allocator, results);
 
-    // Raycast client only needs id + content; map off Entry so copied_at is
-    // dropped from the wire shape rather than serializing the whole row.
+    // Raycast client only needs id + content
     const JsonEntry = struct { id: i64, content: []const u8 };
     const rows = try allocator.alloc(JsonEntry, results.len);
     for (results, rows) |entry, *row| {
         row.* = .{ .id = entry.id, .content = entry.content };
     }
 
-    // Stringify escapes content for us; empty slice emits `[]` (empty-DB case).
     try std.json.Stringify.value(rows, .{}, w);
     try w.writeByte('\n');
 }
