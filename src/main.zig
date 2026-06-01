@@ -258,33 +258,3 @@ fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: any
         std.process.exit(1);
     };
 }
-
-// Truncate to `max` bytes; collapse newlines/tabs to spaces so each
-// result stays on one line.
-fn writeTruncated(w: anytype, s: []const u8, max: usize) !void {
-    var i: usize = 0;
-    var written: usize = 0;
-    while (i < s.len and written < max) : (i += 1) {
-        const ch = s[i];
-        const out_ch: u8 = if (ch == '\n' or ch == '\r' or ch == '\t') ' ' else ch;
-        try w.writeByte(out_ch);
-        written += 1;
-    }
-    if (i < s.len) try w.writeAll("…");
-}
-
-// "YYYY-MM-DD HH:MM" from Unix epoch seconds.
-fn writeIsoTime(w: anytype, epoch_seconds: i64) !void {
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(epoch_seconds) };
-    const day = es.getEpochDay();
-    const year_day = day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const dt = es.getDaySeconds();
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
-        @as(u32, year_day.year),
-        month_day.month.numeric(),
-        @as(u32, month_day.day_index) + 1,
-        dt.getHoursIntoDay(),
-        dt.getMinutesIntoHour(),
-    });
-}
