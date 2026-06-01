@@ -265,38 +265,13 @@ pub const Db = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return Error.StepFailed;
     }
 
-    /// Substring search via LIKE. Caller owns the returned slice and each
-    /// `entry.content` — release everything via `freeEntries`.
-    pub fn search(
-        self: *Db,
-        keyword: []const u8,
-        limit: u32,
-    ) Error![]Entry {
-        const pattern = std.fmt.allocPrint(
-            self.allocator,
-            "%{s}%",
-            .{keyword},
-        ) catch return Error.OutOfMemory;
-        defer self.allocator.free(pattern);
-
+    pub fn getEntries(self: *Db) Error![]Entry {
         const stmt = try self.prepare(
-            "SELECT id, content, copied_at FROM entries " ++
-                "WHERE content LIKE ? ESCAPE '\\' " ++
-                "ORDER BY copied_at DESC LIMIT ?;",
+            "SELECT id, content, copied_at FROM entries ORDER BY copied_at DESC;",
         );
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_text(
-            stmt,
-            1,
-            pattern.ptr,
-            @intCast(pattern.len),
-            SQLITE_STATIC,
-        ) != c.SQLITE_OK) return Error.BindFailed;
-        if (c.sqlite3_bind_int(stmt, 2, @intCast(limit)) != c.SQLITE_OK) return Error.BindFailed;
-
         var out: std.ArrayList(Entry) = .empty;
-
         // errdefer (not defer): on success, caller owns `out` and freeing
         // here would be a use-after-free.
         errdefer {

@@ -1,4 +1,4 @@
-// CLI entry point. Dispatches `daemon`, `search`, `use`.
+// CLI entry point. Dispatches `daemon`, `query`, `use`, `tag`, `untag`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,7 +12,7 @@ const usage =
     \\
     \\Usage:
     \\  zclip daemon              Run the polling daemon (foreground)
-    \\  zclip search <keyword>    Search history (substring match)
+    \\  zclip query               Dump all entries as a JSON array
     \\  zclip use <id>            Put entry <id> back on the pasteboard
     \\
 ;
@@ -48,16 +48,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "daemon")) {
         try daemon.run(alloc, io, environ, out);
-        return;
-    }
-    if (std.mem.eql(u8, cmd, "search")) {
-        if (args.len < 3) {
-            try err.writeAll("zclip search: missing <keyword>\n");
-            try err.flush();
-            std.process.exit(2);
-        }
-        try runSearch(alloc, environ, out, args[2]);
-        try out.flush();
         return;
     }
     if (std.mem.eql(u8, cmd, "use")) {
@@ -137,6 +127,13 @@ pub fn main(init: std.process.Init) !void {
 
         return;
     }
+    if (std.mem.eql(u8, cmd, "query")) {
+        if (args.len == 2) {
+            try runQuery(alloc, environ, out);
+            try out.flush();
+            return;
+        }
+    }
 
     try err.writeAll(usage);
     try err.flush();
@@ -154,11 +151,10 @@ fn dbPath(allocator: std.mem.Allocator, environ: std.process.Environ) ![:0]u8 {
     );
 }
 
-fn runSearch(
+fn runQuery(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
-    w: anytype,
-    keyword: []const u8,
+    w: *Io.Writer,
 ) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
@@ -166,20 +162,20 @@ fn runSearch(
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
 
-    const results = try db.search(keyword, 50);
+    const results = try db.getEntries();
     defer db_mod.freeEntries(allocator, results);
 
-    if (results.len == 0) {
-        try w.print("no matches for {s}\n", .{keyword});
-        return;
+    // Raycast client only needs id + content; map off Entry so copied_at is
+    // dropped from the wire shape rather than serializing the whole row.
+    const JsonEntry = struct { id: i64, content: []const u8 };
+    const rows = try allocator.alloc(JsonEntry, results.len);
+    for (results, rows) |entry, *row| {
+        row.* = .{ .id = entry.id, .content = entry.content };
     }
 
-    for (results) |entry| {
-        try writeIsoTime(w, entry.copied_at);
-        try w.print("  id={d}  ", .{entry.id});
-        try writeTruncated(w, entry.content, 120);
-        try w.writeByte('\n');
-    }
+    // Stringify escapes content for us; empty slice emits `[]` (empty-DB case).
+    try std.json.Stringify.value(rows, .{}, w);
+    try w.writeByte('\n');
 }
 
 fn runUse(
