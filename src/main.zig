@@ -198,8 +198,8 @@ fn runUse(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
     io: Io,
-    w: anytype,
-    err: anytype,
+    w: *Io.Writer,
+    err: *Io.Writer,
     id: i64,
 ) !void {
     const path = try dbPath(allocator, environ);
@@ -220,7 +220,7 @@ fn runUse(
     try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, content.len });
 }
 
-fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anytype, entry_id: i64, tag: []const u8) !void {
+fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io.Writer, entry_id: i64, tag: []const u8) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
 
@@ -246,7 +246,7 @@ fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anyty
     };
 }
 
-fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: anytype, entry_id: i64, tag: []const u8) !void {
+fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io.Writer, entry_id: i64, tag: []const u8) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
 
