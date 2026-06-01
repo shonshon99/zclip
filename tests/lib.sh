@@ -60,9 +60,9 @@ reset_db() {
     # Scope the wipe to zclip's leaf dir only — never the shared .local parent.
     rm -rf "$ZDIR"
     mkdir -p "$ZDIR"
-    # No `zclip add` exists; `search` opens the DB and runs the migration
+    # No `zclip add` exists; `query` opens the DB and runs the migration
     # runner, creating the schema. Then seed entries directly with sqlite3.
-    "$ZCLIP" search __bootstrap__ >/dev/null 2>&1
+    "$ZCLIP" query >/dev/null 2>&1
     seed_entry 1 'hello world' 0
 }
 
