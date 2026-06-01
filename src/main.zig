@@ -19,6 +19,11 @@ const usage =
     \\
 ;
 
+// Subcommands. `stringToEnum` maps argv[1] to a variant, so dispatch is one
+// exhaustive switch instead of an `eql` chain — adding a command is a compile
+// error until the switch handles it.
+const Command = enum { daemon, use, query, tag, untag };
+
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -45,105 +50,77 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const cmd = args[1];
     const environ = init.minimal.environ;
-
-    if (std.mem.eql(u8, cmd, "daemon")) {
-        try daemon.run(alloc, io, environ, out);
-        return;
-    }
-    if (std.mem.eql(u8, cmd, "use")) {
-        if (args.len < 3) {
-            try err.writeAll("zclip use: missing <id>\n");
-            try err.flush();
-            std.process.exit(2);
-        }
-        const id = std.fmt.parseInt(i64, args[2], 10) catch {
-            try err.print("zclip use: invalid id {s}\n", .{args[2]});
-            try err.flush();
-            std.process.exit(2);
-        };
-        try runUse(alloc, environ, io, out, err, id);
-        try out.flush();
-        return;
-    }
-    if (std.mem.eql(u8, cmd, "tag")) {
-        if (args.len != 4) {
-            try err.writeAll("zclip tag: usage: zclip tag <id> <tag>\n");
-            try err.flush();
-            std.process.exit(2);
-        }
-
-        const id = std.fmt.parseInt(i64, args[2], 10) catch {
-            try err.print("zclip tag: invalid id {s}\n", .{args[2]});
-            try err.flush();
-            std.process.exit(2);
-        };
-
-        const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
-        if (trimmed.len == 0) {
-            try err.print("zclip tag: invalid tag {s}\n", .{args[3]});
-            try err.flush();
-            std.process.exit(2);
-        }
-
-        const buf = try alloc.alloc(u8, trimmed.len);
-        const tag = std.ascii.lowerString(buf, trimmed);
-
-        try runTag(alloc, environ, err, id, tag);
-
-        return;
-    }
-    if (std.mem.eql(u8, cmd, "untag")) {
-        if (args.len != 4) {
-            try err.writeAll("zclip untag: usage: zclip untag <id> <tag>\n");
-            try err.flush();
-            std.process.exit(2);
-        }
-
-        const id = std.fmt.parseInt(i64, args[2], 10) catch {
-            try err.print("zclip untag: invalid id {s}\n", .{args[2]});
-            try err.flush();
-            std.process.exit(2);
-        };
-
-        const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
-        if (trimmed.len == 0) {
-            try err.print("zclip untag: invalid tag {s}\n", .{args[3]});
-            try err.flush();
-            std.process.exit(2);
-        }
-
-        const buf = try alloc.alloc(u8, trimmed.len);
-        const tag = std.ascii.lowerString(buf, trimmed);
-
-        try runUntag(alloc, environ, err, id, tag);
-
-        return;
-    }
-    if (std.mem.eql(u8, cmd, "query")) {
-        if (args.len == 2) {
-            try runQuery(alloc, environ, out, null);
-            try out.flush();
-            return;
-        }
-
-        // Only `--tag <name>` is accepted: exactly one flag taking one value.
-        if (args.len == 4 and std.mem.eql(u8, args[2], "--tag")) {
-            // Trim to match stored names: tag/untag trim before insert
-            try runQuery(alloc, environ, out, std.mem.trim(u8, args[3], " \t\r\n"));
-            try out.flush();
-            return;
-        }
-
-        try err.writeAll("zclip query: usage: zclip query [--tag <name>]\n");
+    const command = std.meta.stringToEnum(Command, args[1]) orelse {
+        try err.writeAll(usage);
         try err.flush();
         std.process.exit(2);
-    }
+    };
 
-    try err.writeAll(usage);
-    try err.flush();
-    std.process.exit(2);
+    switch (command) {
+        .daemon => try daemon.run(alloc, io, environ, out),
+        .use => {
+            if (args.len < 3) {
+                try err.writeAll("zclip use: missing <id>\n");
+                try err.flush();
+                std.process.exit(2);
+            }
+            const id = std.fmt.parseInt(i64, args[2], 10) catch {
+                try err.print("zclip use: invalid id {s}\n", .{args[2]});
+                try err.flush();
+                std.process.exit(2);
+            };
+            try runUse(alloc, environ, io, out, err, id);
+            try out.flush();
+        },
+        .tag, .untag => {
+            if (args.len != 4) {
+                try err.print("zclip {s}: usage: zclip {s} <id> <tag>\n", .{ @tagName(command), @tagName(command) });
+                try err.flush();
+                std.process.exit(2);
+            }
+
+            const id = std.fmt.parseInt(i64, args[2], 10) catch {
+                try err.print("zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
+                try err.flush();
+                std.process.exit(2);
+            };
+
+            const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
+            if (trimmed.len == 0) {
+                try err.print("zclip {s}: invalid tag {s}\n", .{ @tagName(command), args[3] });
+                try err.flush();
+                std.process.exit(2);
+            }
+
+            const buf = try alloc.alloc(u8, trimmed.len);
+            const tag = std.ascii.lowerString(buf, trimmed);
+
+            if (command == .tag)
+                try runTag(alloc, environ, err, id, tag)
+            else
+                try runUntag(alloc, environ, err, id, tag);
+        },
+        .query => {
+            if (args.len == 2) {
+                try runQuery(alloc, environ, out, null);
+                try out.flush();
+                return;
+            }
+
+            // Only `--tag <name>` is accepted: exactly one flag taking one value.
+            if (args.len == 4 and std.mem.eql(u8, args[2], "--tag")) {
+                // Trim to match stored names: tag/untag trim before insert
+                try runQuery(alloc, environ, out, std.mem.trim(u8, args[3], " \t\r\n"));
+                try out.flush();
+                return;
+            }
+
+            try err.writeAll("zclip query: usage: zclip query [--tag <name>]\n");
+            try err.flush();
+            std.process.exit(2);
+        },
+    }
 }
 
 // Returns sentinel-0 slice — SQLite's C API needs `const char *`.
