@@ -400,8 +400,8 @@ pub const Db = struct {
     }
 };
 
-/// Free a slice returned by `search` — both per-entry `content` buffers
-/// and the slice itself.
+/// Free an `Entry` slice — both the per-entry `content` buffers and the
+/// slice itself.
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     for (entries) |e| allocator.free(e.content);
     allocator.free(entries);
