@@ -12,8 +12,10 @@ const usage =
     \\
     \\Usage:
     \\  zclip daemon              Run the polling daemon (foreground)
-    \\  zclip query               Dump all entries as a JSON array
+    \\  zclip query [--tag <name>]  Dump entries as a JSON array (optionally one tag)
     \\  zclip use <id>            Put entry <id> back on the pasteboard
+    \\  zclip tag <id> <tag>      Attach one tag to an entry
+    \\  zclip untag <id> <tag>    Remove one tag from an entry
     \\
 ;
 
