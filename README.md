@@ -67,6 +67,7 @@ with the `sqlite3` CLI any time.
 ```
 zclip daemon                  Run the polling daemon (foreground)
 zclip query [--tag <name>]    Dump entries as a JSON array (newest first)
+zclip tags                    Dump all tag names as a JSON array
 zclip use <id>                Write entry <id> back to the pasteboard
 zclip tag <id> <tag>          Attach one tag to an entry
 zclip untag <id> <tag>        Remove one tag from an entry
@@ -112,6 +113,16 @@ Output schema:
 ```
 
 `content` is JSON-escaped. Output is minified (one line) with a trailing newline.
+
+### `zclip tags`
+
+Dumps every tag name as a **JSON array of strings**, alphabetical. Feeds the
+external picker's tag filter (so it can offer the set of tags without scanning
+entries). No tags → `[]`, exit 0.
+
+```json
+["home", "work"]
+```
 
 ### `zclip use <id>`
 
