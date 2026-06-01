@@ -16,10 +16,17 @@ export default async function Command() {
     // throw. Without this listener Node escalates ENOENT to an uncaught
     // exception and crashes the command. Must attach before unref().
     child.on("error", (err) =>
-      showToast({ style: Toast.Style.Failure, title: "Failed to start daemon", message: String(err) }),
+      showToast({
+        style: Toast.Style.Failure,
+        title: "Failed to start daemon",
+        message: String(err),
+      }),
     );
     child.unref();
-    await showToast({ style: Toast.Style.Success, title: "zclip daemon started" });
+    await showToast({
+      style: Toast.Style.Success,
+      title: "zclip daemon started",
+    });
   } catch (err) {
     // Belt-and-suspenders: spawn only throws sync on arg-validation errors.
     await showToast({
