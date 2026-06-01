@@ -1,57 +1,16 @@
-# zclip
+# zclip — contributor notes
 
 Persistent clipboard history daemon for macOS. Zig + libsqlite3 + NSPasteboard.
 
-This file: what a future Claude session needs to be productive immediately —
-over-arching project facts grounded in the source. Forward-looking plans live in
-the issue tracker, not here.
-
-## What zclip is
-
-zclip is a permanent clipboard store. The daemon polls NSPasteboard and inserts
-every copy into a single SQLite file the user owns, retaining it indefinitely (no
-auto-eviction). Duplicate content is deduped by hash and its `copied_at` bumped.
-Entries carry user-assigned tags. The CLI (`daemon`, `query`, `use`, `tag`,
-`untag`) exposes the archive; `query` dumps entries as JSON and `use` writes an
-entry back to the pasteboard, so zclip can back an external picker that loads the
-archive, filters it client-side, and pastes a chosen entry.
-
-What zclip provides over a stock clipboard manager:
-
-- Permanent retention (years, not weeks).
-- User tags on any entry.
-- A single local SQLite file the user fully owns, queryable directly.
-
-## Commands
-
-```
-zig build                 # produces zig-out/bin/zclip
-zig build run -- daemon   # run daemon via build system
-./zig-out/bin/zclip daemon
-./zig-out/bin/zclip query              # dump all entries as JSON (newest-first)
-./zig-out/bin/zclip query --tag <name> # filter to entries carrying one tag
-./zig-out/bin/zclip use <id>           # rewrite entry to the pasteboard
-./zig-out/bin/zclip tag <id> <tag>     # attach one tag to an entry (lowercased)
-./zig-out/bin/zclip untag <id> <tag>   # remove one tag from an entry
-```
-
-DB lives at `~/.local/share/zclip/history.db`. Pidfile at `~/.local/share/zclip/zclip.pid`.
-
-### Functional tests
-
-```
-./tests/run_all.sh          # all suites (tag, untag, query, use, daemon)
-./tests/run_all.sh --safe   # skip clipboard-touching suites (use, daemon) — for CI
-```
-
-Each suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d` so the
-real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes that temp
-HOME. One throwaway HOME per suite.
+**User-facing docs (what zclip is, install, every command, JSON schema, exit
+codes) live in [README.md](README.md).** This file is the opposite audience:
+invariants, FFI/ABI gotchas, and version-pinned choices a future session needs
+before touching the code. Forward-looking plans live in the issue tracker.
 
 ## Layout
 
 ```
-src/main.zig       CLI router, query/use/tag/untag commands, JSON + ISO timestamp formatting
+src/main.zig       CLI router, query/use/tag/untag commands, JSON formatting
 src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
 src/db.zig         SQLite wrapper (translate-c on src/sqlite_c.h)
 src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
@@ -63,6 +22,10 @@ tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
 tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
 tests/*_test.sh    Per-command suites: tag, untag, query, use, daemon
 ```
+
+Each test suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d`
+so the real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes
+that temp HOME. One throwaway HOME per suite. (How to run: README → Tests.)
 
 ## Zig version
 
@@ -88,7 +51,10 @@ Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-gen
 
 **WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
 
-## Schema
+## Schema & migrations
+
+User-facing schema summary is in README. Mechanics and invariants that matter
+when changing it:
 
 ```sql
 -- v1
@@ -110,12 +76,6 @@ Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`)
 
 Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those.
 
-## Known tradeoffs
-
-- **DB growth is unbounded by design.** Permanent retention is the value proposition. Pruning via raw SQL is always available; auto-eviction intentionally not implemented.
-- **Plaintext at rest.** Concealed-type filter catches password-manager copies, but anything not flagged (API keys pasted from docs, tokens in terminal output) ends up readable on disk. FileVault covers the stolen-laptop threat; same-account access still sees plaintext.
-- **Polling latency.** 1-second poll loses copies made and overwritten inside the gap. macOS exposes no public pasteboard-change notification — polling is the standard approach across clipboard tools.
-
 ## Design principles
 
 - Local-first. Single SQLite file the user fully owns.
@@ -123,3 +83,4 @@ Concise WHY-comments across all files. Explain non-obvious reasoning: version-pi
 - WAL mode — CLI reads never block daemon writes.
 - `dev.zclip.origin` marker and `ConcealedType` filter are both load-bearing — don't strip (see gotchas).
 - Schema changes go through the `MIGRATIONS` runner — append-only, never edit a shipped entry.
+- DB growth is unbounded **by design** — permanent retention is the value proposition; auto-eviction intentionally not implemented.
