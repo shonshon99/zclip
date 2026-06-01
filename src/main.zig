@@ -68,12 +68,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "tag")) {
-        if (args.len < 3) {
-            try err.writeAll("zclip tag: missing <id>\n");
-            try err.flush();
-            std.process.exit(2);
-        } else if (args.len < 4) {
-            try err.writeAll("zclip tag: missing <tag>\n");
+        if (args.len != 4) {
+            try err.writeAll("zclip tag: usage: zclip tag <id> <tag>\n");
             try err.flush();
             std.process.exit(2);
         }
@@ -99,12 +95,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "untag")) {
-        if (args.len < 3) {
-            try err.writeAll("zclip untag: missing <id>\n");
-            try err.flush();
-            std.process.exit(2);
-        } else if (args.len < 4) {
-            try err.writeAll("zclip untag: missing <tag>\n");
+        if (args.len != 4) {
+            try err.writeAll("zclip untag: usage: zclip untag <id> <tag>\n");
             try err.flush();
             std.process.exit(2);
         }
