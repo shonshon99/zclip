@@ -346,6 +346,34 @@ pub const Db = struct {
         ) catch Error.OutOfMemory;
     }
 
+    /// All tag names, alphabetical. Caller owns the slice and each name
+    pub fn getTagNames(self: *Db) Error![][]u8 {
+        const stmt = try self.prepare("SELECT name FROM tags ORDER BY name;");
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |n| self.allocator.free(n);
+            out.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return Error.StepFailed;
+
+            const text_ptr = c.sqlite3_column_text(stmt, 0);
+            const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const name = self.allocator.dupe(
+                u8,
+                @as([*]const u8, @ptrCast(text_ptr))[0..text_len],
+            ) catch return Error.OutOfMemory;
+            out.append(self.allocator, name) catch return Error.OutOfMemory;
+        }
+
+        return out.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
+    }
+
     pub fn insertTag(self: *Db, tag: []const u8) Error!void {
         const stmt = try self.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?);");
         defer _ = c.sqlite3_finalize(stmt);
@@ -405,4 +433,10 @@ pub const Db = struct {
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     for (entries) |e| allocator.free(e.content);
     allocator.free(entries);
+}
+
+/// Free a tag-name slice — each name plus the slice.
+pub fn freeTagNames(allocator: std.mem.Allocator, names: [][]u8) void {
+    for (names) |n| allocator.free(n);
+    allocator.free(names);
 }

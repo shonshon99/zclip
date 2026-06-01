@@ -1,4 +1,4 @@
-// CLI entry point. Dispatches `daemon`, `query`, `use`, `tag`, `untag`.
+// CLI entry point. Dispatches `daemon`, `query`, `tags`, `use`, `tag`, `untag`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -13,6 +13,7 @@ const usage =
     \\Usage:
     \\  zclip daemon              Run the polling daemon (foreground)
     \\  zclip query [--tag <name>]  Dump entries as a JSON array (optionally one tag)
+    \\  zclip tags                Dump all tag names as a JSON array
     \\  zclip use <id>            Put entry <id> back on the pasteboard
     \\  zclip tag <id> <tag>      Attach one tag to an entry
     \\  zclip untag <id> <tag>    Remove one tag from an entry
@@ -21,7 +22,7 @@ const usage =
 
 // Commands. Dispatch is one exhaustive switch over the parsed enum,
 // a new variant won't compile until the switch handles it.
-const Command = enum { daemon, use, query, tag, untag };
+const Command = enum { daemon, use, query, tags, tag, untag };
 
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
 pub fn main(init: std.process.Init) !void {
@@ -119,6 +120,10 @@ pub fn main(init: std.process.Init) !void {
             try err.flush();
             std.process.exit(2);
         },
+        .tags => {
+            try runTags(alloc, environ, out);
+            try out.flush();
+        },
     }
 }
 
@@ -159,6 +164,25 @@ fn runQuery(
     }
 
     try std.json.Stringify.value(rows, .{}, w);
+    try w.writeByte('\n');
+}
+
+fn runTags(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    w: *Io.Writer,
+) !void {
+    const path = try dbPath(allocator, environ);
+    defer allocator.free(path);
+
+    var db = try db_mod.Db.open(allocator, path);
+    defer db.close();
+
+    const names = try db.getTagNames();
+    defer db_mod.freeTagNames(allocator, names);
+
+    // Stringify a []const []const u8 → JSON array of strings; [] when empty.
+    try std.json.Stringify.value(names, .{}, w);
     try w.writeByte('\n');
 }
 
