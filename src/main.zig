@@ -129,10 +129,20 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "query")) {
         if (args.len == 2) {
-            try runQuery(alloc, environ, out);
+            try runQuery(alloc, environ, out, null);
             try out.flush();
             return;
         }
+        // Only `--tag <name>` is accepted: exactly one flag taking one value.
+        // A comma-separated value is one literal tag name, not a list (#5).
+        if (args.len == 4 and std.mem.eql(u8, args[2], "--tag")) {
+            try runQuery(alloc, environ, out, args[3]);
+            try out.flush();
+            return;
+        }
+        try err.writeAll("zclip query: usage: zclip query [--tag <name>]\n");
+        try err.flush();
+        std.process.exit(2);
     }
 
     try err.writeAll(usage);
@@ -155,6 +165,7 @@ fn runQuery(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
     w: *Io.Writer,
+    tag: ?[]const u8,
 ) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
@@ -162,7 +173,10 @@ fn runQuery(
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
 
-    const results = try db.getEntries();
+    const results = if (tag) |t|
+        try db.getEntriesByTag(t)
+    else
+        try db.getEntries();
     defer db_mod.freeEntries(allocator, results);
 
     // Raycast client only needs id + content; map off Entry so copied_at is

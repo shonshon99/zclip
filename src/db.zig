@@ -270,7 +270,32 @@ pub const Db = struct {
             "SELECT id, content, copied_at FROM entries ORDER BY copied_at DESC;",
         );
         defer _ = c.sqlite3_finalize(stmt);
+        return self.collectEntries(stmt);
+    }
 
+    /// Entries carrying `tag`, newest first. No cap — the tag is the bound.
+    /// `tags.name` is COLLATE NOCASE, so the match is case-insensitive.
+    pub fn getEntriesByTag(self: *Db, tag: []const u8) Error![]Entry {
+        const stmt = try self.prepare(
+            "SELECT e.id, e.content, e.copied_at FROM entries e " ++
+                "JOIN entry_tags et ON et.entry_id = e.id " ++
+                "JOIN tags t ON t.id = et.tag_id " ++
+                "WHERE t.name = ? ORDER BY e.copied_at DESC;",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(
+            stmt,
+            1,
+            tag.ptr,
+            @intCast(tag.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+        return self.collectEntries(stmt);
+    }
+
+    // Drains a prepared SELECT whose columns are (id, content, copied_at) into
+    // an owned slice. Finalizing the stmt stays with the caller.
+    fn collectEntries(self: *Db, stmt: *c.sqlite3_stmt) Error![]Entry {
         var out: std.ArrayList(Entry) = .empty;
         // errdefer (not defer): on success, caller owns `out` and freeing
         // here would be a use-after-free.
