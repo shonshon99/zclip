@@ -88,6 +88,9 @@ pub const Db = struct {
             return Error.OpenFailed;
         }
         var db: Db = .{ .handle = h.?, .allocator = allocator };
+        // Every step below is fallible. Without this the handle escapes on
+        // those paths, unlike the failed-open branch above which does close.
+        errdefer _ = c.sqlite3_close(db.handle);
 
         // WAL lets CLI readers run concurrently with daemon writes
         // instead of serialising through a rollback journal.
