@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref — macOS minutes bill at 10x.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build + functional tests
+    # macOS is mandatory: build.zig links AppKit/Foundation and resolves
+    # sqlite3 from the Darwin SDK; the suites shell out to sqlite3/pbcopy.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Empty `version` resolves minimum_zig_version ("0.16.0") from
+      # build.zig.zon, so the pin lives in one place. Caches the global Zig
+      # cache by default, avoiding a zig_objc git fetch every run.
+      - uses: mlugg/setup-zig@v2
+
+      - name: Build
+        run: zig build
+
+      # --safe skips use/daemon: they mutate the real NSPasteboard and depend
+      # on 1s-poll timing, which is flaky on a hosted runner. run_all.sh exits
+      # nonzero if any suite fails, which fails the check.
+      - name: Functional tests
+        run: bash tests/run_all.sh --safe
