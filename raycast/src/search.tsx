@@ -17,23 +17,52 @@ import { Entry, query, tag, tags, untag, use } from "./zclip";
 // valid tag name to zclip, so use a value tags can't take.
 const ALL_TAGS = "__all__";
 
-// One free-text form serves both tag and untag. The name is typed (not picked
-// from a list) because the operations take an arbitrary name: add may create a
-// brand-new tag, and remove may target a tag not in the current filtered set.
+// Namespaces the synthetic "create this tag" dropdown item. A raw typed string
+// is indistinguishable from a real tag's value, so the prefix is what tells
+// submit() which branch it's in.
+const NEW_TAG = "__new__:";
+
+// One form serves both tag and untag, but the input differs by mode.
+//
+// add:    a searchable dropdown over the live tag list, plus a synthetic
+//         Create "…" item when the typed text matches no existing tag — picking
+//         beats retyping, and typos can't silently spawn near-duplicate tags.
+// remove: still free text. `zclip query` returns only {id, content}, so we
+//         can't know which tags *this* entry carries; a dropdown of all tags
+//         would offer removals that are no-ops.
 function TagForm({
   entry,
   mode,
+  tagList,
   onMutated,
 }: {
   entry: Entry;
   mode: "add" | "remove";
+  tagList: string[];
   onMutated: () => void;
 }) {
   const { pop } = useNavigation();
   const verb = mode === "add" ? "Add Tag" : "Remove Tag";
+  const [searchText, setSearchText] = useState("");
+  const [selected, setSelected] = useState("");
+
+  // Match zclip's own normalization (it trims + lowercases before storing) so
+  // typing "Work" resolves to the existing `work` instead of offering to
+  // create a second one.
+  const typed = searchText.trim().toLowerCase();
+  const showCreate =
+    mode === "add" && typed.length > 0 && !tagList.includes(typed);
 
   async function submit(values: { name: string }) {
-    const name = values.name.trim();
+    const name = (
+      mode === "remove"
+        ? values.name
+        : selected.startsWith(NEW_TAG)
+          ? selected.slice(NEW_TAG.length)
+          : // Falls back to the raw search text for the window where the
+            // dropdown re-selected but onChange hasn't landed yet.
+            selected || searchText
+    ).trim();
     if (!name) {
       await showToast({
         style: Toast.Style.Failure,
@@ -68,7 +97,43 @@ function TagForm({
         </ActionPanel>
       }
     >
-      <Form.TextField id="name" title="Tag" placeholder="e.g. work" autoFocus />
+      {mode === "add" ? (
+        // No controlled `value`: the Create item's value changes on every
+        // keystroke, so a pinned value would go stale and Raycast would warn
+        // about a selection that isn't in the item list.
+        //
+        // `filtering` is forced true because passing onSearchTextChange
+        // implicitly turns it off — we still want native fuzzy matching over
+        // the real tags, and only use the text to build the Create item.
+        <Form.Dropdown
+          id="name"
+          title="Tag"
+          placeholder="Search or create a tag…"
+          filtering
+          autoFocus
+          onSearchTextChange={setSearchText}
+          onChange={setSelected}
+        >
+          {showCreate && (
+            <Form.Dropdown.Item
+              key={NEW_TAG + typed}
+              title={`Create "${typed}"`}
+              value={NEW_TAG + typed}
+              icon={Icon.Plus}
+            />
+          )}
+          {tagList.map((t) => (
+            <Form.Dropdown.Item key={t} title={t} value={t} icon={Icon.Tag} />
+          ))}
+        </Form.Dropdown>
+      ) : (
+        <Form.TextField
+          id="name"
+          title="Tag"
+          placeholder="e.g. work"
+          autoFocus
+        />
+      )}
     </Form>
   );
 }
@@ -167,6 +232,7 @@ export default function Command() {
                   <TagForm
                     entry={entry}
                     mode="add"
+                    tagList={tagList}
                     onMutated={() => setRevision((r) => r + 1)}
                   />
                 }
@@ -179,6 +245,7 @@ export default function Command() {
                   <TagForm
                     entry={entry}
                     mode="remove"
+                    tagList={tagList}
                     onMutated={() => setRevision((r) => r + 1)}
                   />
                 }
