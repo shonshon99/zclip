@@ -1,19 +1,3 @@
-//! SQLite wrapper.
-//!
-//! Schema:
-//!   entries(id INTEGER PK, content TEXT, hash BLOB, copied_at INTEGER)
-//!   index on hash, index on copied_at
-//!
-//! `upsertByHash` updates `copied_at` if the same content has been seen
-//! before (matched by SHA256), otherwise inserts.
-//!
-//! Schema is created/upgraded by the `MIGRATIONS` runner (PRAGMA
-//! user_version) on `open`, not inline — append a migration for any change.
-//!
-//! Bindings come from translate-c run over `src/sqlite_c.h` and wired into
-//! the build as the `sqlite_c` module (see `build.zig`). 0.16 deprecated
-//! source-level `@cImport` in favor of build-system translate-c.
-
 const std = @import("std");
 
 pub const c = @import("sqlite_c");
@@ -30,14 +14,8 @@ const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
 // Ordered schema migrations. MIGRATIONS[i] is the SQL that upgrades the DB
 // from `user_version` i to i+1; the target version is `MIGRATIONS.len`.
-//
-// Append-only contract: never edit, reorder, or delete an existing entry —
-// each string has already run (and bumped user_version) on live databases,
-// so changing one would silently desync those installs from fresh ones. New
-// schema changes go in a NEW trailing entry. A single entry may hold several
-// `;`-separated statements; sqlite3_exec runs them all.
 const MIGRATIONS = [_][]const u8{
-    // v1 — initial schema
+    // v1
     \\CREATE TABLE IF NOT EXISTS entries (
     \\  id        INTEGER PRIMARY KEY,
     \\  content   TEXT NOT NULL,
