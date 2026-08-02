@@ -239,12 +239,20 @@ fn runUse(
     defer db_mod.freeEntry(allocator, entry);
 
     const pb = clipboard.Pasteboard.general();
-    const byte_len = switch (entry.kind) {
+
+    // `ok` is AppKit's verdict on the write, carried out of the switch so the
+    // failure is handled once for both kinds — and, critically, *before*
+    // `touch` below. Bumping copied_at for content that never reached the
+    // pasteboard would reorder history around an event that didn't happen.
+    const Written = struct { ok: bool, byte_len: usize };
+    const written: Written = switch (entry.kind) {
         .text => blk: {
             // Non-null for .text per the schema's CHECK constraint.
             const content = entry.content.?;
-            try pb.writeStringAsOrigin(allocator, content);
-            break :blk content.len;
+            break :blk .{
+                .ok = try pb.writeStringAsOrigin(allocator, content),
+                .byte_len = content.len,
+            };
         },
         .image => blk: {
             const img = entry.image.?;
@@ -265,13 +273,21 @@ fn runUse(
                 try err.flush();
                 std.process.exit(1);
             };
-            pb.writeDataAsOrigin(bytes, img_type.uti);
-            break :blk bytes.len;
+            break :blk .{
+                .ok = pb.writeDataAsOrigin(bytes, img_type.uti),
+                .byte_len = bytes.len,
+            };
         },
     };
 
+    if (!written.ok) {
+        try err.print("zclip use: pasteboard rejected the write for id {d}\n", .{id});
+        try err.flush();
+        std.process.exit(1);
+    }
+
     try db.touch(id, daemon.unixNow(io));
-    try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, byte_len });
+    try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, written.byte_len });
 }
 
 /// Materialise image `id`'s thumbnail into the cache directory and print its

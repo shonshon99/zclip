@@ -160,18 +160,24 @@ pub const Pasteboard = struct {
 
     /// Replace pasteboard contents with `content` AND tag with
     /// `dev.zclip.origin` so the daemon's poll loop skips this write.
-    pub fn writeStringAsOrigin(self: Pasteboard, allocator: std.mem.Allocator, content: []const u8) !void {
+    ///
+    /// Returns AppKit's own verdict: `setString:forType:` answers NO when the
+    /// type was never declared for the current change count, which is a real
+    /// failure to put the data where the user asked. Callers must not report
+    /// success on false — see `writeDataAsOrigin`.
+    pub fn writeStringAsOrigin(self: Pasteboard, allocator: std.mem.Allocator, content: []const u8) !bool {
         _ = self.pb.msgSend(c_long, "clearContents", .{});
         self.markOrigin();
 
         const content_ns = try nsStringFromSlice(allocator, content);
         const string_t = nsStringFromCStr(string_type);
-        self.pb.msgSend(void, "setString:forType:", .{ content_ns, string_t });
+        return self.pb.msgSend(bool, "setString:forType:", .{ content_ns, string_t });
     }
 
     /// Image counterpart of `writeStringAsOrigin` — `bytes` go on under `ty`
     /// (the UTI the image was archived as), origin-tagged the same way.
-    pub fn writeDataAsOrigin(self: Pasteboard, bytes: []const u8, ty: [*:0]const u8) void {
+    /// Same contract on the return value.
+    pub fn writeDataAsOrigin(self: Pasteboard, bytes: []const u8, ty: [*:0]const u8) bool {
         _ = self.pb.msgSend(c_long, "clearContents", .{});
         self.markOrigin();
 
@@ -182,7 +188,7 @@ pub const Pasteboard = struct {
             @as(c_ulong, bytes.len),
         });
         const t = nsStringFromCStr(ty);
-        _ = self.pb.msgSend(bool, "setData:forType:", .{ data, t });
+        return self.pb.msgSend(bool, "setData:forType:", .{ data, t });
     }
 
     // Tag before content in both writers above: each set* bumps changeCount,
