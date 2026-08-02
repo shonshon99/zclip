@@ -10,17 +10,19 @@ before touching the code. Forward-looking plans live in the issue tracker.
 ## Layout
 
 ```
-src/main.zig       CLI router, query/use/tag/untag commands, JSON formatting
+src/main.zig       CLI router, query/use/thumb/tag/untag commands, JSON formatting
 src/clipboard.zig  NSPasteboard wrapper via mitchellh/zig-objc
 src/db.zig         SQLite wrapper (translate-c on src/sqlite_c.h)
 src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
+src/image.zig      ImageIO thumbnailing — hand-declared C externs, NOT translate-c
 src/sqlite_c.h     Shim header — `#include <sqlite3.h>` for build-system translate-c
-build.zig          translate-c sqlite3, link AppKit/Foundation; link_libc
+build.zig          translate-c sqlite3, link AppKit/Foundation/ImageIO/CG/CF; link_libc
 build.zig.zon      minimum_zig_version = "0.16.0"
 .zigversion        0.16.0
 tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
 tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
-tests/*_test.sh    Per-command suites: tag, untag, query, use, daemon
+tests/fixtures/    Committed 1024x768 PNG driving the image suite
+tests/*_test.sh    Per-command suites: tag, untag, query, tags, use, daemon, image
 ```
 
 Each test suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d`
@@ -41,6 +43,14 @@ Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-gen
 
 **SQLite destructor sentinels.** `c.SQLITE_TRANSIENT` and `c.SQLITE_STATIC` are macro-expanded as `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits these as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check at comptime. Workaround in `db.zig`: declare `const SQLITE_STATIC: c.sqlite3_destructor_type = null` and pass null. Safe because all bound buffers outlive `sqlite3_finalize` in our usage.
 
+**ImageIO bindings are hand-written externs — translate-c cannot parse the Apple SDK headers.** `src/image.zig` declares ~20 CF/CG/ImageIO symbols with `extern "c"` instead of following the `sqlite_c.h` + `addTranslateC` convention. Two blockers, in order: CGColorSpace.h writes `CGFloat whitePoint[CG_NONNULL_ARRAY 3]` and clang hard-errors on a nullability specifier inside an array bound (fixable by `#undef`ing the nullability macros in a shim); then CGPath.h declares `typedef void (^CGPathApplyBlock)(...)` unguarded, and blocks need `-fblocks`, which `std.Build.Step.TranslateC` has no API to pass — it exposes include paths and `-D` macros, nothing else. Narrowing the includes doesn't dodge it either; CGPath.h arrives transitively via CGImage.h. Don't "restore consistency" by re-adding a shim header without re-checking those two facts.
+
+**CF ownership rules apply in `image.zig`.** "Create"/"Copy" in a CF function name means we own the result and must `CFRelease` it; "Get" means we borrow. `CFDataCreateWithBytesNoCopy` + `kCFAllocatorNull` reads straight out of the Zig slice — every CF object derived from it must die before that slice's owner returns. The options dict passes null callbacks, so it does *not* retain its values; the `CFNumber` must outlive it (defer order handles this).
+
+**Text beats image when the pasteboard offers both.** Rich-text copies publish a TIFF rendering alongside the plain text. The daemon checks `readString` first and only falls through to `imageType()` when there's no non-empty string. Flipping that order turns every copied paragraph into a screenshot.
+
+**`images.path` files are not covered by any cascade.** `entry_tags` cascades on entry delete; the file at `images.path` does not. Any future delete/prune path must unlink the file itself, or `images/` grows forever with orphans.
+
 **NSPasteboard goes through `mitchellh/zig-objc`.** `clipboard.zig` calls `objc.getClass("...")` and `obj.msgSend(Return, "selector:", .{args})`. The lib synthesizes the `objc_msgSend` cast per call site from the Return type + args tuple — no per-selector boilerplate needed. Earlier revisions hand-rolled the FFI (extern `objc_msgSend` + `Send*` fn-pointer typedefs + a `msg(comptime T)` ptrCast helper); git history has the reference if you ever need to inline it again.
 
 **Daemon poll loop wraps each tick in an `objc.AutoreleasePool`.** Methods like `[NSString stringWithUTF8String:]`, `[pb types]`, and `[pb stringForType:]` return autoreleased Obj-C objects. With no pool on the thread they accumulate in a process-global pool that never drains. Pool push/pop per iteration bounds growth. `readString` copies bytes into the caller's allocator *before* the pool drains — don't pass any raw NSString-owned pointer past the `defer pool.deinit()`.
@@ -58,17 +68,27 @@ when changing it:
 
 ```sql
 -- v1
-entries(id INTEGER PK, content TEXT, hash BLOB, copied_at INTEGER)
+entries(id INTEGER PK, kind TEXT NOT NULL DEFAULT 'text', hash BLOB,
+        copied_at INTEGER, content TEXT NULL)
+  CHECK kind IN ('text','image'); CHECK (kind='text') = (content IS NOT NULL)
 index on hash, index on copied_at
--- v2 (tags)
+images(entry_id PK → entries.id ON DELETE CASCADE, path, mime, width, height,
+       byte_len, thumb BLOB)
+  no thumb dimensions column — the PNG's IHDR chunk already carries them
 tags(id INTEGER PK, name TEXT UNIQUE COLLATE NOCASE)
 entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))
   both FKs ON DELETE CASCADE; index on tag_id
 ```
 
-Hash = raw SHA256 (32 bytes). `upsertByHash` updates `copied_at` on match, inserts on miss. Returns `true` for insert, `false` for bump — daemon uses this to log differently.
+Hash = raw SHA256 (32 bytes) of the copied text, or of the original image bytes. Dedup for both kinds runs through `findByHash`; the daemon `touch`es on a hit and `insertText`/`insertImage`s on a miss, logging each differently. `insertImage` is transactional because a half-written image entry (entries row, no images row) is unrepairable.
 
-Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent). To change schema: **append** a new SQL string to `MIGRATIONS` — never edit/reorder/delete an existing entry (each has already run and bumped `user_version` on live DBs). Target version = `MIGRATIONS.len`. Each step runs in its own `BEGIN IMMEDIATE` transaction.
+The second CHECK is what lets `rowToEntry` trust `kind` and skip reading the joined columns for text rows. `entry_select` in `db.zig` is a LEFT JOIN with a **positional** column list — `rowToEntry` indexes it by number, so reordering the SELECT silently corrupts every read. (Table column order is a separate thing and safe to change: every statement names its columns.)
+
+**The big payload column is declared last in both tables** — `entries.content`, `images.thumb`. A row is one record: header of serial types, then column bodies in declaration order, with anything past the local page payload (~`page_size - 35`, so ~4KB by default) spilling onto overflow pages. Reaching a column means skipping all preceding column bytes, so a small column sitting after a 200KB thumbnail costs an overflow-chain walk per row. Declaring metadata first keeps it on the leaf page. Don't reorder a big BLOB/TEXT to the middle for tidiness.
+
+Images split across two stores on purpose: the original stays on disk at `images/<sha256>.<ext>` (content-addressed, so re-copying never writes twice), and only the 512px PNG thumbnail is a BLOB. Putting multi-MB screenshots in the DB would make every `zclip query` pay for them.
+
+Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent).
 
 **`PRAGMA foreign_keys=ON` is load-bearing for `entry_tags`.** It's per-connection and OFF by default, so `Db.open` runs it *before* `migrate()` (the pragma is a no-op inside the migration runner's `BEGIN IMMEDIATE`). Without it, deleting an entry orphans its `entry_tags` rows instead of cascading. Don't move or drop this.
 
@@ -84,3 +104,4 @@ Concise WHY-comments across all files. Explain non-obvious reasoning: version-pi
 - `dev.zclip.origin` marker and `ConcealedType` filter are both load-bearing — don't strip (see gotchas).
 - Schema changes go through the `MIGRATIONS` runner — append-only, never edit a shipped entry.
 - DB growth is unbounded **by design** — permanent retention is the value proposition; auto-eviction intentionally not implemented.
+- Bulk bytes live on disk, derived previews live in the DB. `cache/` is fully regenerable from the DB; `images/` is not — it's the only copy of each original.
