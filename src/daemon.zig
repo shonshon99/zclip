@@ -250,14 +250,23 @@ fn recordImage(
     defer allocator.free(path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 
-    _ = try db.insertImage(&hash, now, .{
+    // Nothing collects orphans: `images.path` sits outside every FK cascade, so
+    // a file whose insert failed would be referenced by nothing and deleted by
+    // nobody. The insert is the commit point — unwind the file if we don't
+    // reach it. Deliberately a `catch`, not an `errdefer`: an errdefer here
+    // would also fire on a later log-write failure and unlink a file the
+    // committed row points at.
+    _ = db.insertImage(&hash, now, .{
         .path = path,
         .mime = img_type.mime,
         .width = summary.width,
         .height = summary.height,
         .byte_len = @intCast(bytes.len),
         .thumb = summary.thumb,
-    });
+    }) catch |err| {
+        Io.Dir.cwd().deleteFile(io, path) catch {};
+        return err;
+    };
 
     try log_w.print("  + new image {d}x{d} {s} ({d} bytes)\n", .{
         summary.width,
