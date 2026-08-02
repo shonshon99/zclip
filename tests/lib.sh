@@ -13,6 +13,12 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZCLIP="$REPO_ROOT/zig-out/bin/zclip"
+FIXTURES="$REPO_ROOT/tests/fixtures"
+# Checked-in 1024x768 PNG. Committed rather than generated so image tests
+# don't depend on which wallpapers/icons a given macOS install happens to
+# ship. Larger than the 512px thumbnail cap on purpose, so a downscale that
+# silently no-ops shows up as a failed dimension assertion.
+SAMPLE_PNG="$FIXTURES/sample_1024x768.png"
 
 if [[ ! -x "$ZCLIP" ]]; then
     echo "error: $ZCLIP not found — run 'zig build' first" >&2
@@ -72,8 +78,37 @@ seed_entry() {
         "INSERT INTO entries (id, content, hash, copied_at) VALUES ($1, '$2', x'00', $3);"
 }
 
+# seed_image_entry <id> <path> <copied_at> [width] [height]
+#
+# Fakes what the daemon writes for an image: a content-less entries row plus
+# its images row. The thumb blob is a stand-in, not a real PNG — tests that
+# need decodable pixels go through the daemon and the pasteboard instead.
+seed_image_entry() {
+    local id="$1" path="$2" ts="$3" w="${4:-1024}" h="${5:-768}"
+    sqlite3 "$DB" "
+        INSERT INTO entries (id, kind, content, hash, copied_at)
+        VALUES ($id, 'image', NULL, randomblob(32), $ts);
+        INSERT INTO images (entry_id, path, mime, width, height, byte_len, thumb)
+        VALUES ($id, '$path', 'image/png', $w, $h, 4242, x'89504E47');
+    "
+}
+
+# Put a PNG file on the real pasteboard as image data (not as a file
+# reference). «class PNGf» is the four-char code for public.png, which is what
+# the daemon probes for first.
+copy_image_to_clipboard() {
+    osascript -e "set the clipboard to (read (POSIX file \"$1\") as «class PNGf»)" >/dev/null
+}
+
 # query <sql> → prints scalar result
 query() { sqlite3 "$DB" "$1"; }
+
+# png_dims <file> → "<width>|<height>", read out of the image itself. The DB
+# stores no thumbnail dimensions — a PNG carries its own in the IHDR chunk.
+png_dims() {
+    sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null |
+        awk '/pixelWidth/{w=$2} /pixelHeight/{h=$2} END{print w "|" h}'
+}
 
 # --- assertions ------------------------------------------------------------
 

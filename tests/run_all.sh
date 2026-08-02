@@ -17,7 +17,7 @@ SAFE_ONLY=0
 
 suites=(tag_test.sh untag_test.sh query_test.sh tags_test.sh)
 if [[ "$SAFE_ONLY" -eq 0 ]]; then
-    suites+=(use_test.sh daemon_test.sh)
+    suites+=(use_test.sh daemon_test.sh image_test.sh)
 fi
 
 rc=0
