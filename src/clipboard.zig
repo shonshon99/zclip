@@ -50,6 +50,43 @@ pub const Pasteboard = struct {
     /// What `NSPasteboardTypeString` resolves to at runtime.
     pub const string_type: [*:0]const u8 = "public.utf8-plain-text";
 
+    /// A pasteboard image flavour, plus how we persist it.
+    pub const ImageType = struct {
+        /// Pasteboard type (UTI) to read/write bytes under.
+        uti: [*:0]const u8,
+        /// Stored in `images.mime`; also what maps back to a UTI on `use`.
+        mime: []const u8,
+        /// File extension for the original on disk.
+        ext: []const u8,
+    };
+
+    /// Probe order is deliberate: a single copy usually lands on the
+    /// pasteboard under several flavours at once (macOS screenshots publish
+    /// both TIFF and PNG), and whichever we pick becomes the bytes we hash and
+    /// archive. PNG first — lossless and far smaller than TIFF. JPEG last: it
+    /// only shows up alone, from apps that publish nothing else.
+    const image_types = [_]ImageType{
+        .{ .uti = "public.png", .mime = "image/png", .ext = "png" },
+        .{ .uti = "public.tiff", .mime = "image/tiff", .ext = "tiff" },
+        .{ .uti = "public.jpeg", .mime = "image/jpeg", .ext = "jpg" },
+    };
+
+    /// First image flavour the pasteboard offers, or null if it holds none.
+    pub fn imageType(self: Pasteboard) ?ImageType {
+        for (image_types) |t| {
+            if (self.hasType(t.uti)) return t;
+        }
+        return null;
+    }
+
+    /// Reverse of `imageType` for writing a stored image back out.
+    pub fn imageTypeForMime(mime: []const u8) ?ImageType {
+        for (image_types) |t| {
+            if (std.mem.eql(u8, t.mime, mime)) return t;
+        }
+        return null;
+    }
+
     /// `.?` panics if NSPasteboard is missing — that's a linker/SDK bug,
     /// not a recoverable runtime condition.
     pub fn general() Pasteboard {
@@ -101,21 +138,61 @@ pub const Pasteboard = struct {
         return try allocator.dupe(u8, slice);
     }
 
+    /// Raw bytes for `ty`, or null if the pasteboard has no data under it.
+    /// Caller owns the returned slice.
+    pub fn readData(
+        self: Pasteboard,
+        allocator: std.mem.Allocator,
+        ty: [*:0]const u8,
+    ) !?[]u8 {
+        const t = nsStringFromCStr(ty);
+        const data = self.pb.msgSend(objc.Object, "dataForType:", .{t});
+        if (data.value == null) return null;
+
+        // `length` is NSUInteger; `bytes` is a `const void *` into storage the
+        // autoreleased NSData owns.
+        const len: usize = @intCast(data.msgSend(c_ulong, "length", .{}));
+        if (len == 0) return null;
+        const ptr = data.msgSend([*]const u8, "bytes", .{});
+        // MUST copy, same contract as readString: the NSData is autoreleased.
+        return try allocator.dupe(u8, ptr[0..len]);
+    }
+
     /// Replace pasteboard contents with `content` AND tag with
     /// `dev.zclip.origin` so the daemon's poll loop skips this write.
     pub fn writeStringAsOrigin(self: Pasteboard, allocator: std.mem.Allocator, content: []const u8) !void {
         _ = self.pb.msgSend(c_long, "clearContents", .{});
-
-        // Tag before content: each setString bumps changeCount, so the daemon
-        // can poll mid-write. Content-first would expose a {content, no-tag}
-        // item it captures as its own (feedback loop). Tag-first leaves only
-        // skippable transients. Value arbitrary — only the type's presence matters.
-        const origin_ns = nsStringFromCStr("1");
-        const origin_t = nsStringFromCStr(origin_type);
-        self.pb.msgSend(void, "setString:forType:", .{ origin_ns, origin_t });
+        self.markOrigin();
 
         const content_ns = try nsStringFromSlice(allocator, content);
         const string_t = nsStringFromCStr(string_type);
         self.pb.msgSend(void, "setString:forType:", .{ content_ns, string_t });
+    }
+
+    /// Image counterpart of `writeStringAsOrigin` — `bytes` go on under `ty`
+    /// (the UTI the image was archived as), origin-tagged the same way.
+    pub fn writeDataAsOrigin(self: Pasteboard, bytes: []const u8, ty: [*:0]const u8) void {
+        _ = self.pb.msgSend(c_long, "clearContents", .{});
+        self.markOrigin();
+
+        const NSData = objc.getClass("NSData").?;
+        // dataWithBytes:length: copies, so `bytes` need not outlive this call.
+        const data = NSData.msgSend(objc.Object, "dataWithBytes:length:", .{
+            bytes.ptr,
+            @as(c_ulong, bytes.len),
+        });
+        const t = nsStringFromCStr(ty);
+        _ = self.pb.msgSend(bool, "setData:forType:", .{ data, t });
+    }
+
+    // Tag before content in both writers above: each set* bumps changeCount,
+    // so the daemon can poll mid-write. Content-first would expose a
+    // {content, no-tag} item it captures as its own (feedback loop).
+    // Tag-first leaves only skippable transients. Value arbitrary — only the
+    // type's presence matters.
+    fn markOrigin(self: Pasteboard) void {
+        const origin_ns = nsStringFromCStr("1");
+        const origin_t = nsStringFromCStr(origin_type);
+        self.pb.msgSend(void, "setString:forType:", .{ origin_ns, origin_t });
     }
 };
