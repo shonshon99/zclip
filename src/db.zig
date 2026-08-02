@@ -482,8 +482,9 @@ pub const Db = struct {
         return try self.rowToEntry(stmt);
     }
 
-    /// Thumbnail PNG bytes for an image entry, or null if `id` isn't one.
-    /// Caller owns the slice.
+    /// Thumbnail PNG bytes for an image entry. Null means only one thing —
+    /// `id` has no `images` row — so callers can report that as an error
+    /// without guessing. Caller owns the slice.
     pub fn getThumb(self: *Db, id: i64) Error!?[]u8 {
         const stmt = try self.prepare("SELECT thumb FROM images WHERE entry_id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -493,9 +494,14 @@ pub const Db = struct {
         if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
-        const ptr = c.sqlite3_column_blob(stmt, 0);
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-        if (len == 0) return null;
+        // sqlite3_column_blob answers NULL for a zero-length blob, so the
+        // pointer is only castable to a non-optional `[*]const u8` when there
+        // are bytes. An owned empty slice, not null: the row does exist, and
+        // conflating the two made `zclip thumb` claim the entry was missing.
+        if (len == 0) return self.allocator.alloc(u8, 0) catch Error.OutOfMemory;
+
+        const ptr = c.sqlite3_column_blob(stmt, 0);
         return self.allocator.dupe(
             u8,
             @as([*]const u8, @ptrCast(ptr))[0..len],

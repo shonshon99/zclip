@@ -313,15 +313,25 @@ fn runThumb(
     defer allocator.free(cache_dir);
     try Io.Dir.cwd().createDirPath(io, cache_dir);
 
+    // Keyed by rowid. Safe only while nothing deletes entries: SQLite hands
+    // out a recycled rowid after a delete (absent AUTOINCREMENT), so any
+    // future delete/prune path must unlink this file too or the next entry to
+    // land on that id serves the previous one's thumbnail.
     const out_path = try std.fmt.allocPrint(allocator, "{s}/{d}.png", .{ cache_dir, id });
     defer allocator.free(out_path);
 
     // An entry's thumbnail never changes, so an existing file is always
     // current — skip both the BLOB read and the write on repeat calls.
+    // Only a missing file means "not cached yet"; anything else (a permission
+    // problem on the cache dir, say) would otherwise be silently retried on
+    // every call and never reported.
     if (Io.Dir.cwd().access(io, out_path, .{})) |_| {
         try w.print("{s}\n", .{out_path});
         return;
-    } else |_| {}
+    } else |access_err| switch (access_err) {
+        error.FileNotFound => {},
+        else => return access_err,
+    }
 
     const thumb = (try db.getThumb(id)) orelse {
         try err.print("zclip thumb: no image entry with id {d}\n", .{id});

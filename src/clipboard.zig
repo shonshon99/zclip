@@ -183,9 +183,12 @@ pub const Pasteboard = struct {
 
         const NSData = objc.getClass("NSData").?;
         // dataWithBytes:length: copies, so `bytes` need not outlive this call.
+        // NSUInteger, so c_ulong. @intCast rather than a bare @as: the two are
+        // the same width on every Apple target we build for, but that's a
+        // target fact, not a language one.
         const data = NSData.msgSend(objc.Object, "dataWithBytes:length:", .{
             bytes.ptr,
-            @as(c_ulong, bytes.len),
+            @as(c_ulong, @intCast(bytes.len)),
         });
         const t = nsStringFromCStr(ty);
         return self.pb.msgSend(bool, "setData:forType:", .{ data, t });
