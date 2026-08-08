@@ -88,8 +88,8 @@ seed_image_entry() {
     sqlite3 "$DB" "
         INSERT INTO entries (id, kind, content, hash, copied_at)
         VALUES ($id, 'image', NULL, randomblob(32), $ts);
-        INSERT INTO images (entry_id, path, mime, width, height, byte_len, thumb)
-        VALUES ($id, '$path', 'image/png', $w, $h, 4242, x'89504E47');
+        INSERT INTO images (entry_id, path, uti, width, height, byte_len, thumb)
+        VALUES ($id, '$path', 'public.png', $w, $h, 4242, x'89504E47');
     "
 }
 

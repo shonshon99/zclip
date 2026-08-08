@@ -41,7 +41,7 @@ const MIGRATIONS = [_][]const u8{
     \\CREATE TABLE IF NOT EXISTS images (
     \\  entry_id     INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
     \\  path         TEXT NOT NULL,
-    \\  mime         TEXT NOT NULL,
+    \\  uti          TEXT NOT NULL,
     \\  width        INTEGER NOT NULL,
     \\  height       INTEGER NOT NULL,
     \\  byte_len     INTEGER NOT NULL,
@@ -80,7 +80,13 @@ pub const Kind = enum { text, image };
 /// small enough that CLI reads remain instant.
 pub const ImageMeta = struct {
     path: []u8,
-    mime: []u8,
+    /// The pasteboard type the original was captured under (`public.png`,
+    /// `public.tiff`, ...). Stored rather than a MIME type because the
+    /// pasteboard is the only producer and the only consumer: `zclip use`
+    /// hands this straight back to `setData:forType:`, so an unrecognised
+    /// value written by a newer build still round-trips. Sentinel-terminated
+    /// so it can cross to NSString without a re-copy.
+    uti: [:0]u8,
     /// Dimensions of the original, not the thumbnail — this is what clients
     /// render as e.g. "Image (1024x1024)".
     width: i64,
@@ -100,10 +106,10 @@ pub const Entry = struct {
 };
 
 /// Everything needed to archive a freshly-copied image. `thumb` is PNG bytes
-/// regardless of the original's `mime`.
+/// regardless of the original's `uti`.
 pub const NewImage = struct {
     path: []const u8,
-    mime: []const u8,
+    uti: []const u8,
     width: i64,
     height: i64,
     byte_len: i64,
@@ -320,7 +326,7 @@ pub const Db = struct {
         // Columns are named, so this is decoupled from the table's own order —
         // it just mirrors it for readability.
         const ins_img = try self.prepare(
-            "INSERT INTO images (entry_id, path, mime, width, height, byte_len, thumb)" ++
+            "INSERT INTO images (entry_id, path, uti, width, height, byte_len, thumb)" ++
                 " VALUES (?, ?, ?, ?, ?, ?, ?);",
         );
         defer _ = c.sqlite3_finalize(ins_img);
@@ -335,8 +341,8 @@ pub const Db = struct {
         if (c.sqlite3_bind_text(
             ins_img,
             3,
-            img.mime.ptr,
-            @intCast(img.mime.len),
+            img.uti.ptr,
+            @intCast(img.uti.len),
             SQLITE_STATIC,
         ) != c.SQLITE_OK) return Error.BindFailed;
         if (c.sqlite3_bind_int64(ins_img, 4, img.width) != c.SQLITE_OK) return Error.BindFailed;
@@ -370,7 +376,7 @@ pub const Db = struct {
     // `rowToEntry` indexes it positionally.
     const entry_select =
         "SELECT e.id, e.kind, e.content, e.copied_at," ++
-        " i.path, i.mime, i.width, i.height, i.byte_len" ++
+        " i.path, i.uti, i.width, i.height, i.byte_len" ++
         " FROM entries e LEFT JOIN images i ON i.entry_id = e.id";
 
     pub fn getEntries(self: *Db) Error![]Entry {
@@ -439,10 +445,10 @@ pub const Db = struct {
         const image: ?ImageMeta = if (kind == .image) blk: {
             const path = (try self.dupeText(stmt, 4)) orelse return Error.StepFailed;
             errdefer self.allocator.free(path);
-            const mime = (try self.dupeText(stmt, 5)) orelse return Error.StepFailed;
+            const uti = (try self.dupeTextZ(stmt, 5)) orelse return Error.StepFailed;
             break :blk .{
                 .path = path,
-                .mime = mime,
+                .uti = uti,
                 .width = c.sqlite3_column_int64(stmt, 6),
                 .height = c.sqlite3_column_int64(stmt, 7),
                 .byte_len = c.sqlite3_column_int64(stmt, 8),
@@ -467,6 +473,21 @@ pub const Db = struct {
         return self.allocator.dupe(
             u8,
             @as([*]const u8, @ptrCast(ptr))[0..len],
+        ) catch Error.OutOfMemory;
+    }
+
+    // As `dupeText`, but re-terminates the copy so the result can be handed to
+    // a C API expecting [*:0]const u8. sqlite's own buffer is NUL-terminated,
+    // but `sqlite3_column_bytes` excludes that byte, so a plain dupe wouldn't
+    // be — and an embedded NUL would truncate at the bridge either way.
+    fn dupeTextZ(self: *Db, stmt: *c.sqlite3_stmt, col: c_int) Error!?[:0]u8 {
+        if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
+        const ptr = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+        return self.allocator.dupeSentinel(
+            u8,
+            @as([*]const u8, @ptrCast(ptr))[0..len],
+            0,
         ) catch Error.OutOfMemory;
     }
 
@@ -595,7 +616,7 @@ pub fn freeEntry(allocator: std.mem.Allocator, e: Entry) void {
     if (e.content) |ct| allocator.free(ct);
     if (e.image) |im| {
         allocator.free(im.path);
-        allocator.free(im.mime);
+        allocator.free(im.uti);
     }
 }
 

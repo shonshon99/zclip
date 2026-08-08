@@ -72,8 +72,10 @@ entries(id INTEGER PK, kind TEXT NOT NULL DEFAULT 'text', hash BLOB,
         copied_at INTEGER, content TEXT NULL)
   CHECK kind IN ('text','image'); CHECK (kind='text') = (content IS NOT NULL)
 index on hash, index on copied_at
-images(entry_id PK → entries.id ON DELETE CASCADE, path, mime, width, height,
+images(entry_id PK → entries.id ON DELETE CASCADE, path, uti, width, height,
        byte_len, thumb BLOB)
+  uti = pasteboard type, not a MIME type — the pasteboard is the only producer
+  and only consumer, so `use` hands it straight back to setData:forType:
   no thumb dimensions column — the PNG's IHDR chunk already carries them
 tags(id INTEGER PK, name TEXT UNIQUE COLLATE NOCASE)
 entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))

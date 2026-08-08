@@ -216,7 +216,7 @@ fn recordImage(
     img_type: clipboard.Pasteboard.ImageType,
     images_dir: []const u8,
 ) !void {
-    const bytes = (try pb.readData(allocator, img_type.uti)) orelse return;
+    const bytes = (try pb.readData(allocator, img_type.uti.ptr)) orelse return;
     defer allocator.free(bytes);
 
     var hash: [Sha256.digest_length]u8 = undefined;
@@ -258,7 +258,7 @@ fn recordImage(
     // committed row points at.
     _ = db.insertImage(&hash, now, .{
         .path = path,
-        .mime = img_type.mime,
+        .uti = img_type.uti,
         .width = summary.width,
         .height = summary.height,
         .byte_len = @intCast(bytes.len),
@@ -271,7 +271,7 @@ fn recordImage(
     try log_w.print("  + new image {d}x{d} {s} ({d} bytes)\n", .{
         summary.width,
         summary.height,
-        img_type.mime,
+        img_type.uti,
         bytes.len,
     });
     try log_w.flush();

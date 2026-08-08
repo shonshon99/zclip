@@ -52,11 +52,12 @@ pub const Pasteboard = struct {
 
     /// A pasteboard image flavour, plus how we persist it.
     pub const ImageType = struct {
-        /// Pasteboard type (UTI) to read/write bytes under.
-        uti: [*:0]const u8,
-        /// Stored in `images.mime`; also what maps back to a UTI on `use`.
-        mime: []const u8,
-        /// File extension for the original on disk.
+        /// Pasteboard type to read/write bytes under, and what lands in
+        /// `images.uti`. Sentinel-terminated because every consumer is either
+        /// an NSString bridge (`.ptr`) or a SQLite bind (`.len`).
+        uti: [:0]const u8,
+        /// File extension for the original on disk. Kept separate because
+        /// `public.png` is not a filename suffix.
         ext: []const u8,
     };
 
@@ -66,23 +67,15 @@ pub const Pasteboard = struct {
     /// archive. PNG first — lossless and far smaller than TIFF. JPEG last: it
     /// only shows up alone, from apps that publish nothing else.
     const image_types = [_]ImageType{
-        .{ .uti = "public.png", .mime = "image/png", .ext = "png" },
-        .{ .uti = "public.tiff", .mime = "image/tiff", .ext = "tiff" },
-        .{ .uti = "public.jpeg", .mime = "image/jpeg", .ext = "jpg" },
+        .{ .uti = "public.png", .ext = "png" },
+        .{ .uti = "public.tiff", .ext = "tiff" },
+        .{ .uti = "public.jpeg", .ext = "jpg" },
     };
 
     /// First image flavour the pasteboard offers, or null if it holds none.
     pub fn imageType(self: Pasteboard) ?ImageType {
         for (image_types) |t| {
-            if (self.hasType(t.uti)) return t;
-        }
-        return null;
-    }
-
-    /// Reverse of `imageType` for writing a stored image back out.
-    pub fn imageTypeForMime(mime: []const u8) ?ImageType {
-        for (image_types) |t| {
-            if (std.mem.eql(u8, t.mime, mime)) return t;
+            if (self.hasType(t.uti.ptr)) return t;
         }
         return null;
     }

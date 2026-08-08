@@ -236,7 +236,7 @@ text-only.
 
 ```sql
 entries(id INTEGER PK, kind TEXT, hash BLOB, copied_at INTEGER, content TEXT NULL)
-images(entry_id → entries.id PK, path TEXT, mime TEXT, width INTEGER,
+images(entry_id → entries.id PK, path TEXT, uti TEXT, width INTEGER,
        height INTEGER, byte_len INTEGER, thumb BLOB)
 tags(id INTEGER PK, name TEXT UNIQUE COLLATE NOCASE)
 entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))
@@ -245,8 +245,10 @@ entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))
 `hash` is a raw SHA-256 of the content — the copied text for a text entry, the
 original image bytes for an image one — and is the dedup key for both. `kind` is
 `'text'` or `'image'`; `content` is set for text entries and NULL for images,
-which get a row in `images` instead (CHECK constraints enforce both). `thumb` is
-PNG regardless of the original's `mime`. Tag names use `COLLATE NOCASE`, so tag
+which get a row in `images` instead (CHECK constraints enforce both). `uti` is
+the macOS pasteboard type the image was captured under (`public.png`,
+`public.tiff`, `public.jpeg`) and is what `zclip use` writes it back as; `thumb`
+is PNG regardless of it. Tag names use `COLLATE NOCASE`, so tag
 matching is case-insensitive. Migrations are managed by an append-only runner
 keyed on `PRAGMA user_version`.
 

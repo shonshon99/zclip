@@ -27,7 +27,7 @@ stop_daemon "$DAEMON_PID"
 
 assert_eq "1" "$(query "SELECT count(*) FROM entries WHERE kind='image';")" \
     "one image entry recorded"
-assert_eq "image/png" "$(query "SELECT mime FROM images;")" \
+assert_eq "public.png" "$(query "SELECT uti FROM images;")" \
     "captured as PNG (probe order prefers it over TIFF)"
 assert_eq "1024|768" "$(query "SELECT width || '|' || height FROM images;")" \
     "original dimensions stored, not the thumbnail's"

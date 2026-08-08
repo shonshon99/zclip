@@ -266,15 +266,11 @@ fn runUse(
             };
             defer allocator.free(bytes);
 
-            // A mime we can't map back to a UTI would mean the DB was written
-            // by a build that knew more image types than this one.
-            const img_type = clipboard.Pasteboard.imageTypeForMime(img.mime) orelse {
-                try err.print("zclip use: unsupported image type {s}\n", .{img.mime});
-                try err.flush();
-                std.process.exit(1);
-            };
+            // The stored UTI goes back on the pasteboard verbatim — no lookup,
+            // so a row written by a build that captures more image types than
+            // this one still restores correctly.
             break :blk .{
-                .ok = pb.writeDataAsOrigin(bytes, img_type.uti),
+                .ok = pb.writeDataAsOrigin(bytes, img.uti.ptr),
                 .byte_len = bytes.len,
             };
         },
