@@ -23,11 +23,20 @@ tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
 tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
 tests/fixtures/    Committed 1024x768 PNG driving the image suite
 tests/*_test.sh    Per-command suites: tag, untag, query, tags, use, daemon, image
+tools/pbdump.swift Diagnostic: dumps the live pasteboard's flavours + metadata
 ```
 
 Each test suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d`
 so the real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes
 that temp HOME. One throwaway HOME per suite. (How to run: README → Tests.)
+
+`tools/pbdump.swift` answers "what did that app *actually* publish?" — run it
+after copying from a given app to see every UTI on the pasteboard with byte
+counts and image dimensions. That's the evidence behind `image_types`' probe
+order and the text-before-image rule below. Not part of the build or the test
+suite; Swift because it needs no FFI bindings to maintain. Output is
+content-free by default so it's safe to paste into an issue; `--text` opts into
+previewing textual flavours.
 
 ## Zig version
 
