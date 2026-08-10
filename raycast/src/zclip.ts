@@ -1,5 +1,8 @@
 import { getPreferenceValues } from "@raycast/api";
 import { execFile } from "child_process";
+import { existsSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
@@ -57,6 +60,29 @@ export async function use(id: number): Promise<void> {
 export async function thumb(id: number): Promise<string> {
   const { stdout } = await execFileAsync(binaryPath(), ["thumb", String(id)]);
   return stdout.trim();
+}
+
+// Where `zclip thumb` writes, mirrored from src/main.zig (storageDir + the
+// cache/<id>.png convention in runThumb). Duplicating the layout is the price
+// of discovering an already-materialised thumbnail with a stat instead of a
+// subprocess: the path becomes knowable synchronously, so the list can paint
+// its icons in the same frame as its rows. Keep in step with main.zig — HOME is
+// read directly there, with no XDG_DATA_HOME indirection to honour here.
+//
+// Keyed by rowid, so it carries the same caveat as the Zig side: nothing
+// deletes entries today, and a future prune path must unlink these files or a
+// recycled rowid will serve the previous entry's thumbnail.
+function cachedThumbPath(id: number): string {
+  return join(homedir(), ".local", "share", "zclip", "cache", `${id}.png`);
+}
+
+// The cached thumbnail's path, or undefined if it hasn't been materialised yet
+// (first sighting of this entry — the caller falls back to `thumb`). Blocking
+// stat, one per image row: negligible at hundreds, ~25ms at several thousand,
+// and the archive is unbounded by design.
+export function existingThumbPath(id: number): string | undefined {
+  const p = cachedThumbPath(id);
+  return existsSync(p) ? p : undefined;
 }
 
 // Attaches one tag to an entry. zclip trims + lowercases the name itself.
