@@ -94,13 +94,17 @@ cleanly.
 **Images.** When a copy carries image data rather than text, the daemon archives
 the original bytes to `~/.local/share/zclip/images/<sha256>.<ext>` and stores a
 downscaled PNG thumbnail (longest side 512px) in the database, along with the
-original's pixel dimensions, MIME type, and file size. PNG is preferred, then
-TIFF, then JPEG — a single copy often lands on the pasteboard under several of
-these at once, and PNG is lossless and far smaller than TIFF.
+original's pixel dimensions, pasteboard type (`public.png`, not a MIME type),
+and file size. PNG is preferred, then TIFF, then JPEG — a single copy often
+lands on the pasteboard under several of these at once, and PNG is lossless and
+far smaller than TIFF.
 
 Text wins when a copy offers both: rich-text sources (Word, browsers, Preview
 selections) routinely publish a TIFF rendering alongside the plain text, and the
 text is what you meant to copy.
+
+Text entries store the plain-text flavour only. A rich-text copy's `public.rtf`
+and `public.html` flavours are dropped, so `zclip use` pastes unstyled text.
 
 The following copies are **never** recorded:
 

@@ -8,10 +8,21 @@ interface Preferences {
   binaryPath: string;
 }
 
-export interface Entry {
-  id: number;
-  content: string;
-}
+// Mirrors zclip query's JSON, which serialises with emit_null_optional_fields
+// off — inapplicable keys are *absent*, not null. So an image row has no
+// `content` key at all, and a discriminated union on `kind` is what makes the
+// compiler force a check before either half is touched.
+export type Entry =
+  | { id: number; kind: "text"; content: string }
+  | {
+      id: number;
+      kind: "image";
+      width: number;
+      height: number;
+      // Original on disk; what `zclip use` puts back on the pasteboard.
+      path: string;
+      byte_len: number;
+    };
 
 export function binaryPath(): string {
   return (
@@ -36,6 +47,16 @@ export async function query(tag?: string): Promise<Entry[]> {
 // skips it) and bumps its recency.
 export async function use(id: number): Promise<void> {
   await execFileAsync(binaryPath(), ["use", String(id)]);
+}
+
+// Materialises entry <id>'s thumbnail into ~/.local/share/zclip/cache/<id>.png
+// and returns that path. Prints a bare path + newline, not JSON — hence trim()
+// rather than JSON.parse. Idempotent and cheap on repeat calls (zclip
+// short-circuits on an existing file), so no caching is needed on this side.
+// Rejects (exit 1) when <id> is a text entry or unknown.
+export async function thumb(id: number): Promise<string> {
+  const { stdout } = await execFileAsync(binaryPath(), ["thumb", String(id)]);
+  return stdout.trim();
 }
 
 // Attaches one tag to an entry. zclip trims + lowercases the name itself.

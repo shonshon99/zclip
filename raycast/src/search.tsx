@@ -10,8 +10,8 @@ import {
   Toast,
   useNavigation,
 } from "@raycast/api";
-import { useEffect, useState } from "react";
-import { Entry, query, tag, tags, untag, use } from "./zclip";
+import { useEffect, useRef, useState } from "react";
+import { Entry, query, tag, tags, thumb, untag, use } from "./zclip";
 
 // Sentinel dropdown value meaning "no tag filter" — empty string would be a
 // valid tag name to zclip, so use a value tags can't take.
@@ -22,14 +22,57 @@ const ALL_TAGS = "__all__";
 // submit() which branch it's in.
 const NEW_TAG = "__new__:";
 
+// Resolved state of one entry's thumbnail. Absent from the map means "not
+// fetched yet", which is what drives the detail pane's loading spinner.
+type ThumbState = { path: string } | { error: string };
+
+// Collapses every whitespace run (newlines included) so a multi-line entry
+// still occupies exactly one row in the left pane. The *whole* collapsed string
+// goes into the title: Raycast clips it to the pane and draws the ellipsis
+// itself, so the cut tracks the real pane width — which no constant here could,
+// since the width moves with the window size and the detail split.
+function oneLine(s: string): string {
+  const collapsed = s.replace(/\s+/g, " ").trim();
+  // Raycast warns on an empty title; a whitespace-only entry collapses to "".
+  return collapsed || "(whitespace)";
+}
+
+// Fences content for the detail pane so it renders verbatim rather than as
+// markdown — a copied "# heading" or table stays what's actually on the
+// clipboard. The fence is one backtick longer than the longest run inside the
+// content, otherwise copied markdown containing ``` would close it early and
+// spill the rest out as rendered markup.
+function fenced(s: string): string {
+  let longest = 0;
+  for (const run of s.match(/`+/g) ?? [])
+    longest = Math.max(longest, run.length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}\n${s}\n${fence}`;
+}
+
+// CommonMark angle-bracket link destination. encodeURI escapes spaces but
+// leaves parentheses alone, and a bare "(" in $HOME would otherwise terminate
+// an ![](…) destination early.
+function fileUrl(p: string): string {
+  return `<file://${encodeURI(p)}>`;
+}
+
+function detailMarkdown(entry: Entry, state: ThumbState | undefined): string {
+  if (entry.kind === "text") return fenced(entry.content);
+  if (state === undefined) return "";
+  if ("error" in state)
+    return `Could not load thumbnail.\n\n${fenced(state.error)}`;
+  return `![](${fileUrl(state.path)})`;
+}
+
 // One form serves both tag and untag, but the input differs by mode.
 //
 // add:    a searchable dropdown over the live tag list, plus a synthetic
 //         Create "…" item when the typed text matches no existing tag — picking
 //         beats retyping, and typos can't silently spawn near-duplicate tags.
-// remove: still free text. `zclip query` returns only {id, content}, so we
-//         can't know which tags *this* entry carries; a dropdown of all tags
-//         would offer removals that are no-ops.
+// remove: still free text. `zclip query` exposes no per-entry tag membership,
+//         so we can't know which tags *this* entry carries; a dropdown of all
+//         tags would offer removals that are no-ops.
 function TagForm({
   entry,
   mode,
@@ -146,6 +189,13 @@ export default function Command() {
   // Bumped after a tag/untag so both fetches below re-run (new tag may need to
   // appear in the dropdown; current tag's entry set may have changed).
   const [revision, setRevision] = useState(0);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Never cleared on a revision bump: an entry's thumbnail is immutable, and
+  // `zclip thumb` is keyed by the same rowid.
+  const [thumbs, setThumbs] = useState<Record<number, ThumbState>>({});
+  // A ref, not state, so a second render can't slip a duplicate exec past the
+  // guard before the first one's setThumbs lands.
+  const inFlight = useRef(new Set<number>());
 
   // (Re)load the tag list for the dropdown.
   useEffect(() => {
@@ -171,11 +221,31 @@ export default function Command() {
       .finally(() => setLoading(false));
   }, [selectedTag, revision]);
 
+  // Fetch the highlighted entry's thumbnail, one entry at a time. Deliberately
+  // per-selection rather than eager over the whole archive: `zclip query` omits
+  // the thumbnail BLOB for exactly this reason — a listing re-read on every
+  // keystroke must not carry megabytes of image data.
+  useEffect(() => {
+    if (selectedId === null) return;
+    const id = Number(selectedId);
+    const entry = entries.find((e) => e.id === id);
+    if (entry?.kind !== "image") return;
+    if (thumbs[id] !== undefined || inFlight.current.has(id)) return;
+    inFlight.current.add(id);
+    thumb(id)
+      .then((path) => setThumbs((m) => ({ ...m, [id]: { path } })))
+      .catch((err) => setThumbs((m) => ({ ...m, [id]: { error: String(err) } })))
+      .finally(() => inFlight.current.delete(id));
+  }, [selectedId, entries, thumbs]);
+
   async function paste(entry: Entry) {
     // Record the use (bumps recency, writes to pasteboard with origin marker)…
     await use(entry.id).catch(() => undefined);
     // …then paste the content into the frontmost app and dismiss Raycast.
-    await Clipboard.paste(entry.content);
+    // Images have no `content`; Raycast pastes them from the original on disk.
+    await Clipboard.paste(
+      entry.kind === "text" ? entry.content : { file: entry.path },
+    );
     // Invalidate the fetch so the next time this command opens, the just-used
     // entry shows at the top (zclip use bumped its copied_at). Guards against
     // Raycast keeping the command "warm" and skipping a remount.
@@ -186,6 +256,8 @@ export default function Command() {
   return (
     <List
       isLoading={loading}
+      isShowingDetail
+      onSelectionChange={setSelectedId}
       searchBarPlaceholder="Search clipboard history…"
       searchBarAccessory={
         <List.Dropdown
@@ -213,47 +285,71 @@ export default function Command() {
             : "Try a different tag or clear the filter."
         }
       />
-      {entries.map((entry) => (
-        <List.Item
-          key={entry.id}
-          title={entry.content.replace(/\s+/g, " ").trim()}
-          actions={
-            <ActionPanel>
-              <Action title="Paste" onAction={() => paste(entry)} />
-              <Action.CopyToClipboard
-                title="Copy to Clipboard"
-                content={entry.content}
+      {entries.map((entry) => {
+        const state = entry.kind === "image" ? thumbs[entry.id] : undefined;
+        return (
+          <List.Item
+            key={entry.id}
+            // Explicit id so onSelectionChange hands back something we can map
+            // straight back to an entry.
+            id={String(entry.id)}
+            icon={entry.kind === "image" ? Icon.Image : Icon.Text}
+            // The in-memory filter matches on title, so image entries are only
+            // reachable by typing "image" or their dimensions. There is no text
+            // on them to match against.
+            title={
+              entry.kind === "image"
+                ? `Image (${entry.width}x${entry.height})`
+                : oneLine(entry.content)
+            }
+            detail={
+              <List.Item.Detail
+                isLoading={entry.kind === "image" && state === undefined}
+                markdown={detailMarkdown(entry, state)}
               />
-              <Action.Push
-                title="Add Tag"
-                icon={Icon.Tag}
-                shortcut={{ modifiers: ["cmd"], key: "t" }}
-                target={
-                  <TagForm
-                    entry={entry}
-                    mode="add"
-                    tagList={tagList}
-                    onMutated={() => setRevision((r) => r + 1)}
-                  />
-                }
-              />
-              <Action.Push
-                title="Remove Tag"
-                icon={Icon.Tag}
-                shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
-                target={
-                  <TagForm
-                    entry={entry}
-                    mode="remove"
-                    tagList={tagList}
-                    onMutated={() => setRevision((r) => r + 1)}
-                  />
-                }
-              />
-            </ActionPanel>
-          }
-        />
-      ))}
+            }
+            actions={
+              <ActionPanel>
+                <Action title="Paste" onAction={() => paste(entry)} />
+                <Action.CopyToClipboard
+                  title="Copy to Clipboard"
+                  content={
+                    entry.kind === "text"
+                      ? entry.content
+                      : { file: entry.path }
+                  }
+                />
+                <Action.Push
+                  title="Add Tag"
+                  icon={Icon.Tag}
+                  shortcut={{ modifiers: ["cmd"], key: "t" }}
+                  target={
+                    <TagForm
+                      entry={entry}
+                      mode="add"
+                      tagList={tagList}
+                      onMutated={() => setRevision((r) => r + 1)}
+                    />
+                  }
+                />
+                <Action.Push
+                  title="Remove Tag"
+                  icon={Icon.Tag}
+                  shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
+                  target={
+                    <TagForm
+                      entry={entry}
+                      mode="remove"
+                      tagList={tagList}
+                      onMutated={() => setRevision((r) => r + 1)}
+                    />
+                  }
+                />
+              </ActionPanel>
+            }
+          />
+        );
+      })}
     </List>
   );
 }

@@ -30,6 +30,12 @@ This extension requires the `zclip` binary on your machine.
 - **Search Clipboard** — loads the archive, filters in-memory as you type,
   filters by tag via the dropdown, and pastes or copies a chosen entry. Also
   supports adding (`⌘T`) and removing (`⌘⇧T`) tags.
+
+  The view is split: the left pane shows one line per entry (text collapsed to a
+  single line, images labelled `Image (WxH)`), and the right pane shows the full
+  content — text verbatim in a code block, images as the thumbnail `zclip thumb`
+  writes to `~/.local/share/zclip/cache/`. Thumbnails are fetched only for the
+  highlighted entry, so a large archive stays cheap to browse.
 - **Run Daemon** — starts the `zclip` polling daemon in the background.
 
 ## Privacy
