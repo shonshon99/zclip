@@ -24,7 +24,17 @@ tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
 tests/fixtures/    Committed 1024x768 PNG driving the image suite
 tests/*_test.sh    Per-command suites: tag, untag, query, tags, use, daemon, image
 tools/pbdump.swift Diagnostic: dumps the live pasteboard's flavours + metadata
+raycast/src/zclip.ts    Extension↔CLI boundary: execs the binary, parses its JSON
+raycast/src/search.tsx  "Search Clipboard" — list/detail panes, tag filter, tagging
+raycast/src/run-daemon.tsx  no-view command that starts the daemon
 ```
+
+The Raycast extension is the reference consumer of the CLI's contract — it is
+the reason `query` emits JSON, `thumb` prints a bare path, and `use` exists at
+all. It is a separate npm project (`cd raycast && npm install`); `npx ray build`
+and `npx ray lint` are the checks, and neither runs from `zig build` or
+`tests/run_all.sh`. Changing a command's output shape means changing `zclip.ts`
+in the same commit.
 
 Each test suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d`
 so the real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes
@@ -60,6 +70,10 @@ Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-gen
 
 **`images.path` files are not covered by any cascade.** `entry_tags` cascades on entry delete; the file at `images.path` does not. Any future delete/prune path must unlink the file itself, or `images/` grows forever with orphans.
 
+**The `cache/<id>.png` layout is encoded in two places.** `runThumb` in `main.zig` builds it from `storageDir` + rowid; `cachedThumbPath` in `raycast/src/zclip.ts` reconstructs the same string from `homedir()`. The extension does that so an already-materialised thumbnail is discoverable with one `existsSync` instead of a subprocess — that's what lets the list paint row icons in the same frame as the rows, rather than popping them in as `zclip thumb` results arrive. Nothing enforces the two agree, and divergence fails *soft*: every stat misses, the extension silently falls back to `zclip thumb` per row, and the only symptom is the pop-in returning. If you change `storageDir` or the filename convention, grep the extension. Emitting a `thumb_path` field from `query` would collapse this back to one definition, at the cost of a wider JSON contract.
+
+**Cache filenames are keyed by rowid, which SQLite recycles.** Both `runThumb`'s comment and the extension's stat-based lookup assume `cache/<id>.png` belongs to entry `<id>`. Without `AUTOINCREMENT`, a delete frees that rowid for reuse, so a future prune path must unlink the cache file too — otherwise the next entry to land on the id serves the previous one's thumbnail. Same hazard as `images.path` above, one more place to fix.
+
 **NSPasteboard goes through `mitchellh/zig-objc`.** `clipboard.zig` calls `objc.getClass("...")` and `obj.msgSend(Return, "selector:", .{args})`. The lib synthesizes the `objc_msgSend` cast per call site from the Return type + args tuple — no per-selector boilerplate needed. Earlier revisions hand-rolled the FFI (extern `objc_msgSend` + `Send*` fn-pointer typedefs + a `msg(comptime T)` ptrCast helper); git history has the reference if you ever need to inline it again.
 
 **Daemon poll loop wraps each tick in an `objc.AutoreleasePool`.** Methods like `[NSString stringWithUTF8String:]`, `[pb types]`, and `[pb stringForType:]` return autoreleased Obj-C objects. With no pool on the thread they accumulate in a process-global pool that never drains. Pool push/pop per iteration bounds growth. `readString` copies bytes into the caller's allocator *before* the pool drains — don't pass any raw NSString-owned pointer past the `defer pool.deinit()`.
@@ -69,6 +83,43 @@ Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-gen
 **Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext. This is defense-in-depth only — apps that don't set the type (Slack, browsers pasting from docs) bypass it.
 
 **WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
+
+## Raycast extension gotchas
+
+Thumbnail loading in `search.tsx` looks over-engineered and is not. Three
+distinct hazards shape it — the first one shipped and had to be chased down, the
+other two were sidestepped during the same work. All three are easy to
+reintroduce by "simplifying".
+
+**The thumbnail prefetch must never cancel in-flight work.** A thumbnail is
+immutable and keyed by rowid, so a result arriving after a re-render, a tag
+switch, or an unmount is still correct — and React 18 makes `setState` on an
+unmounted component a no-op, so there is nothing to leak. The original version
+cancelled on effect cleanup: any double-invoke (StrictMode on mount, or a tag
+switch mid-prefetch) discarded the running batch while its ids stayed marked in
+the `requested` ref, so nothing re-queued them and exactly `POOL_SIZE` rows kept
+the placeholder icon permanently. The symptom is deceptive: *some* images load
+and which ones varies per launch, which reads like a flaky CLI rather than a
+React lifecycle bug. (It isn't the CLI — 200 concurrent `zclip thumb` calls,
+cold cache and warm, fail zero times.)
+
+**`requested` tracks requested, not in-flight.** Ids stay marked after they
+resolve. That is what lets the prefetch effect depend on `entries` alone; adding
+`thumbs` to the dep array re-enters on every resolution and spawns a fresh pool
+each time.
+
+**Seed the thumb map in the same tick as `setEntries`, and compute it outside
+the updater.** React batches the two `setState`s into one render, so the first
+frame with rows already has its icons — split across ticks and the pop-in comes
+straight back. `seedCachedThumbs` mutates the `requested` ref, so calling it
+inline inside the `setThumbs` updater would make the updater impure; StrictMode
+double-invokes updaters, the second call finds every id already marked, returns
+`{}`, and silently drops the whole seed.
+
+**`zclip thumb` still runs, just not on the warm path.** It is the only thing
+that can turn the `images.thumb` BLOB into a file, so a never-before-seen image
+costs one subprocess, once, ever. `query` and `tags` remain one exec each per
+open.
 
 ## Schema & migrations
 

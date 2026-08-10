@@ -5,13 +5,23 @@ import {
   closeMainWindow,
   Form,
   Icon,
+  Image,
   List,
   showToast,
   Toast,
   useNavigation,
 } from "@raycast/api";
 import { useEffect, useRef, useState } from "react";
-import { Entry, query, tag, tags, thumb, untag, use } from "./zclip";
+import {
+  Entry,
+  existingThumbPath,
+  query,
+  tag,
+  tags,
+  thumb,
+  untag,
+  use,
+} from "./zclip";
 
 // Sentinel dropdown value meaning "no tag filter" — empty string would be a
 // valid tag name to zclip, so use a value tags can't take.
@@ -21,6 +31,11 @@ const ALL_TAGS = "__all__";
 // is indistinguishable from a real tag's value, so the prefix is what tells
 // submit() which branch it's in.
 const NEW_TAG = "__new__:";
+
+// Concurrent `zclip thumb` subprocesses during the prefetch below. Small on
+// purpose: each one is a process spawn plus an ImageIO decode, and saturating
+// the CPU here would stall the list's own rendering.
+const POOL_SIZE = 4;
 
 // Resolved state of one entry's thumbnail. Absent from the map means "not
 // fetched yet", which is what drives the detail pane's loading spinner.
@@ -60,6 +75,25 @@ function fenced(s: string): string {
 // an ![](…) destination early.
 function fileUrl(p: string): string {
   return `<file://${encodeURI(p)}>`;
+}
+
+// Resolves every thumbnail that's already on disk, synchronously, so the first
+// render can carry its icons instead of popping them in one subprocess result
+// at a time. Marks each hit in `seen` — that's what keeps the prefetch below
+// from re-fetching a thumbnail we just proved exists.
+function seedCachedThumbs(
+  rows: Entry[],
+  seen: Set<number>,
+): Record<number, ThumbState> {
+  const seeded: Record<number, ThumbState> = {};
+  for (const e of rows) {
+    if (e.kind !== "image" || seen.has(e.id)) continue;
+    const path = existingThumbPath(e.id);
+    if (path === undefined) continue;
+    seeded[e.id] = { path };
+    seen.add(e.id);
+  }
+  return seeded;
 }
 
 function detailMarkdown(entry: Entry, state: ThumbState | undefined): string {
@@ -194,13 +228,14 @@ export default function Command() {
   // Bumped after a tag/untag so both fetches below re-run (new tag may need to
   // appear in the dropdown; current tag's entry set may have changed).
   const [revision, setRevision] = useState(0);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   // Never cleared on a revision bump: an entry's thumbnail is immutable, and
   // `zclip thumb` is keyed by the same rowid.
   const [thumbs, setThumbs] = useState<Record<number, ThumbState>>({});
   // A ref, not state, so a second render can't slip a duplicate exec past the
-  // guard before the first one's setThumbs lands.
-  const inFlight = useRef(new Set<number>());
+  // guard before the first one's setThumbs lands. Tracks *requested*, not
+  // in-flight: entries already resolved into `thumbs` must stay marked, or the
+  // effect below would re-queue them on its next run.
+  const requested = useRef(new Set<number>());
 
   // (Re)load the tag list for the dropdown.
   useEffect(() => {
@@ -215,7 +250,18 @@ export default function Command() {
   useEffect(() => {
     setLoading(true);
     query(selectedTag === ALL_TAGS ? undefined : selectedTag)
-      .then(setEntries)
+      .then((rows) => {
+        // Seeded outside the updater on purpose: seedCachedThumbs mutates
+        // `requested`, and StrictMode double-invokes updater functions. Called
+        // inline, the second invocation would find every id already marked,
+        // return {}, and silently drop the whole seed.
+        const seeded = seedCachedThumbs(rows, requested.current);
+        // Both setStates land in one tick, so React batches them into a single
+        // render and the first frame showing rows already shows their icons.
+        // Split these across ticks and the pop-in comes straight back.
+        setThumbs((m) => ({ ...m, ...seeded }));
+        setEntries(rows);
+      })
       .catch((err) =>
         showToast({
           style: Toast.Style.Failure,
@@ -226,22 +272,48 @@ export default function Command() {
       .finally(() => setLoading(false));
   }, [selectedTag, revision]);
 
-  // Fetch the highlighted entry's thumbnail, one entry at a time. Deliberately
-  // per-selection rather than eager over the whole archive: `zclip query` omits
-  // the thumbnail BLOB for exactly this reason — a listing re-read on every
-  // keystroke must not carry megabytes of image data.
+  // Materialise the thumbnails the seed above *couldn't* resolve — an image
+  // copied since the last open, or a first run against a cold cache. Everything
+  // already on disk was marked in `requested` before the first paint, so in the
+  // steady state this queue is empty and no subprocess runs at all.
+  //
+  // Bounded pool because each `zclip thumb` is a subprocess and the archive is
+  // unbounded by design. Only the first pass over a given entry actually
+  // renders; zclip short-circuits on an existing cache file after that.
+  //
+  // Depends on `entries` alone, never `thumbs`: resolving one thumbnail
+  // re-renders, and a `thumbs` dep would re-enter here and spawn another full
+  // set of workers each time. `requested` is what makes the queue idempotent.
   useEffect(() => {
-    if (selectedId === null) return;
-    const id = Number(selectedId);
-    const entry = entries.find((e) => e.id === id);
-    if (entry?.kind !== "image") return;
-    if (thumbs[id] !== undefined || inFlight.current.has(id)) return;
-    inFlight.current.add(id);
-    thumb(id)
-      .then((path) => setThumbs((m) => ({ ...m, [id]: { path } })))
-      .catch((err) => setThumbs((m) => ({ ...m, [id]: { error: String(err) } })))
-      .finally(() => inFlight.current.delete(id));
-  }, [selectedId, entries, thumbs]);
+    const queue = entries.filter(
+      (e) => e.kind === "image" && !requested.current.has(e.id),
+    );
+    if (queue.length === 0) return;
+    for (const e of queue) requested.current.add(e.id);
+
+    // No cancellation on cleanup, deliberately. A thumbnail is immutable and
+    // keyed by rowid, so a result landing after a re-render, a tag switch, or
+    // an unmount is still correct — and React 18 makes a setState on an
+    // unmounted component a no-op, so there's nothing to leak. Dropping late
+    // results is what broke this before: an effect re-run (StrictMode's
+    // double-invoke, or a tag switch mid-prefetch) discarded the in-flight
+    // batch, and since `requested` already had those ids, nothing re-queued
+    // them — exactly POOL_SIZE rows kept the placeholder icon forever.
+    async function worker() {
+      for (let e = queue.shift(); e; e = queue.shift()) {
+        const id = e.id;
+        try {
+          const path = await thumb(id);
+          setThumbs((m) => ({ ...m, [id]: { path } }));
+        } catch (err) {
+          // Stays marked as requested — a thumb that failed once (unlinked
+          // original, bad rowid) fails the same way on every retry.
+          setThumbs((m) => ({ ...m, [id]: { error: String(err) } }));
+        }
+      }
+    }
+    for (let i = 0; i < POOL_SIZE; i++) void worker();
+  }, [entries]);
 
   async function paste(entry: Entry) {
     // Record the use (bumps recency, writes to pasteboard with origin marker)…
@@ -262,7 +334,6 @@ export default function Command() {
     <List
       isLoading={loading}
       isShowingDetail
-      onSelectionChange={setSelectedId}
       searchBarPlaceholder="Search clipboard history…"
       searchBarAccessory={
         <List.Dropdown
@@ -298,7 +369,16 @@ export default function Command() {
             // Explicit id so onSelectionChange hands back something we can map
             // straight back to an entry.
             id={String(entry.id)}
-            icon={entry.kind === "image" ? Icon.Image : Icon.Text}
+            // The thumbnail itself once it lands; Icon.Image is the placeholder
+            // for the window before the prefetch resolves (and permanently for
+            // one that failed).
+            icon={
+              state && "path" in state
+                ? { source: state.path, mask: Image.Mask.RoundedRectangle }
+                : entry.kind === "image"
+                  ? Icon.Image
+                  : Icon.Text
+            }
             // The in-memory filter matches on title, so image entries are only
             // reachable by typing "image" or their dimensions. There is no text
             // on them to match against.
@@ -319,9 +399,7 @@ export default function Command() {
                 <Action.CopyToClipboard
                   title="Copy to Clipboard"
                   content={
-                    entry.kind === "text"
-                      ? entry.content
-                      : { file: entry.path }
+                    entry.kind === "text" ? entry.content : { file: entry.path }
                   }
                 />
                 <Action.Push
