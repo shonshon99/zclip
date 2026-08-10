@@ -18,7 +18,7 @@ section "query dumps all entries, newest-first, as minified JSON"
 seed_corpus
 out="$("$ZCLIP" query 2>/dev/null)"
 assert_eq \
-    '[{"id":3,"content":"third"},{"id":2,"content":"second"},{"id":1,"content":"hello world"}]' \
+    '[{"id":3,"kind":"text","content":"third"},{"id":2,"kind":"text","content":"second"},{"id":1,"kind":"text","content":"hello world"}]' \
     "$out" "exact JSON, copied_at DESC ordering"
 
 section "objects carry only id + content (no copied_at, no tags)"
@@ -48,7 +48,7 @@ seed_corpus
 "$ZCLIP" tag 3 work >/dev/null 2>&1
 out="$("$ZCLIP" query --tag work 2>/dev/null)"
 assert_eq \
-    '[{"id":3,"content":"third"},{"id":1,"content":"hello world"}]' \
+    '[{"id":3,"kind":"text","content":"third"},{"id":1,"kind":"text","content":"hello world"}]' \
     "$out" "work-tagged entries only, copied_at DESC"
 
 section "--tag match is case-insensitive (tags.name COLLATE NOCASE)"

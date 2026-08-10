@@ -1,19 +1,3 @@
-//! SQLite wrapper.
-//!
-//! Schema:
-//!   entries(id INTEGER PK, content TEXT, hash BLOB, copied_at INTEGER)
-//!   index on hash, index on copied_at
-//!
-//! `upsertByHash` updates `copied_at` if the same content has been seen
-//! before (matched by SHA256), otherwise inserts.
-//!
-//! Schema is created/upgraded by the `MIGRATIONS` runner (PRAGMA
-//! user_version) on `open`, not inline — append a migration for any change.
-//!
-//! Bindings come from translate-c run over `src/sqlite_c.h` and wired into
-//! the build as the `sqlite_c` module (see `build.zig`). 0.16 deprecated
-//! source-level `@cImport` in favor of build-system translate-c.
-
 const std = @import("std");
 
 pub const c = @import("sqlite_c");
@@ -30,22 +14,39 @@ const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
 // Ordered schema migrations. MIGRATIONS[i] is the SQL that upgrades the DB
 // from `user_version` i to i+1; the target version is `MIGRATIONS.len`.
-//
-// Append-only contract: never edit, reorder, or delete an existing entry —
-// each string has already run (and bumped user_version) on live databases,
-// so changing one would silently desync those installs from fresh ones. New
-// schema changes go in a NEW trailing entry. A single entry may hold several
-// `;`-separated statements; sqlite3_exec runs them all.
 const MIGRATIONS = [_][]const u8{
-    // v1 — initial schema
+    // v1
+    //
+    // Column order is deliberate in both tables: the one big payload goes
+    // LAST. A row is stored as a single record (header of serial types, then
+    // column bodies in declaration order), and anything past the local page
+    // payload — roughly page_size minus 35 bytes, so ~4KB by default — spills
+    // onto a chain of overflow pages. Reading a column means skipping every
+    // preceding column's bytes, so a small column declared after a 200KB
+    // thumbnail costs an overflow-chain walk to reach. Keeping all the
+    // fixed-size metadata ahead of `content`/`thumb` means it's readable
+    // straight off the leaf page.
     \\CREATE TABLE IF NOT EXISTS entries (
     \\  id        INTEGER PRIMARY KEY,
-    \\  content   TEXT NOT NULL,
+    \\  kind      TEXT NOT NULL DEFAULT 'text',
     \\  hash      BLOB NOT NULL,
-    \\  copied_at INTEGER NOT NULL
+    \\  copied_at INTEGER NOT NULL,
+    \\  content   TEXT,
+    \\  CHECK (kind IN ('text', 'image')),
+    \\  CHECK ((kind = 'text') = (content IS NOT NULL))
     \\);
     \\CREATE INDEX IF NOT EXISTS entries_hash_idx ON entries(hash);
     \\CREATE INDEX IF NOT EXISTS entries_copied_at_idx ON entries(copied_at);
+    \\
+    \\CREATE TABLE IF NOT EXISTS images (
+    \\  entry_id     INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
+    \\  path         TEXT NOT NULL,
+    \\  uti          TEXT NOT NULL,
+    \\  width        INTEGER NOT NULL,
+    \\  height       INTEGER NOT NULL,
+    \\  byte_len     INTEGER NOT NULL,
+    \\  thumb        BLOB NOT NULL
+    \\);
     \\
     \\CREATE TABLE IF NOT EXISTS tags (
     \\  id        INTEGER PRIMARY KEY,
@@ -69,10 +70,50 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const Kind = enum { text, image };
+
+/// Image row joined onto an entry. Strings owned by the caller's allocator.
+///
+/// The pixels live in two places on purpose: the untouched original sits at
+/// `path` on disk (that's what `zclip use` puts back on the pasteboard), while
+/// only the downscaled thumbnail is a BLOB in the DB, so `history.db` stays
+/// small enough that CLI reads remain instant.
+pub const ImageMeta = struct {
+    path: []u8,
+    /// The pasteboard type the original was captured under (`public.png`,
+    /// `public.tiff`, ...). Stored rather than a MIME type because the
+    /// pasteboard is the only producer and the only consumer: `zclip use`
+    /// hands this straight back to `setData:forType:`, so an unrecognised
+    /// value written by a newer build still round-trips. Sentinel-terminated
+    /// so it can cross to NSString without a re-copy.
+    uti: [:0]u8,
+    /// Dimensions of the original, not the thumbnail — this is what clients
+    /// render as e.g. "Image (1024x1024)".
+    width: i64,
+    height: i64,
+    /// Size of the original file at `path`.
+    byte_len: i64,
+};
+
 pub const Entry = struct {
     id: i64,
-    content: []u8, // owned by caller's allocator
+    kind: Kind,
+    /// Set iff `kind == .text`; the schema CHECKs the two agree.
+    content: ?[]u8,
+    /// Set iff `kind == .image`.
+    image: ?ImageMeta,
     copied_at: i64,
+};
+
+/// Everything needed to archive a freshly-copied image. `thumb` is PNG bytes
+/// regardless of the original's `uti`.
+pub const NewImage = struct {
+    path: []const u8,
+    uti: []const u8,
+    width: i64,
+    height: i64,
+    byte_len: i64,
+    thumb: []const u8,
 };
 
 pub const Db = struct {
@@ -194,49 +235,42 @@ pub const Db = struct {
         return stmt.?;
     }
 
-    /// Upsert by content hash. Returns true if a new row was inserted,
-    /// false if an existing row's `copied_at` was bumped.
-    pub fn upsertByHash(
-        self: *Db,
-        content: []const u8,
-        hash: []const u8,
-        now: i64,
-    ) Error!bool {
-        // Step 1 — probe by hash, not content. 32-byte indexed compare beats
-        // scanning a possibly-huge TEXT column; this is the dedup key.
-        const find_sql = "SELECT id FROM entries WHERE hash = ? LIMIT 1;";
-        const find_stmt = try self.prepare(find_sql);
-        defer _ = c.sqlite3_finalize(find_stmt);
+    /// Existing entry id for `hash`, or null. Probing by hash rather than
+    /// content is the dedup key: a 32-byte indexed compare beats scanning a
+    /// possibly-huge TEXT column, and it's the only workable probe for images
+    /// (whose bytes aren't in the DB at all).
+    ///
+    /// Callers bump `copied_at` via `touch` on a hit so re-copied content
+    /// resurfaces as most-recent, and insert on a miss. Not one transaction:
+    /// safe only because the daemon is the sole writer (single-instance via
+    /// the pidfile lock).
+    pub fn findByHash(self: *Db, hash: []const u8) Error!?i64 {
+        const stmt = try self.prepare("SELECT id FROM entries WHERE hash = ? LIMIT 1;");
+        defer _ = c.sqlite3_finalize(stmt);
 
         if (c.sqlite3_bind_blob(
-            find_stmt,
+            stmt,
             1,
             hash.ptr,
             @intCast(hash.len),
             SQLITE_STATIC,
         ) != c.SQLITE_OK) return Error.BindFailed;
 
-        // Step 2 — hash already present: bump copied_at so re-copied content
-        // resurfaces as most-recent. Return false so the daemon logs a bump,
-        // not a new entry. SQLITE_ROW = match; SQLITE_DONE = none (fall to insert).
-        const step_rc = c.sqlite3_step(find_stmt);
-        if (step_rc == c.SQLITE_ROW) {
-            const existing_id = c.sqlite3_column_int64(find_stmt, 0);
-            const upd = try self.prepare("UPDATE entries SET copied_at = ? WHERE id = ?;");
-            defer _ = c.sqlite3_finalize(upd);
-            if (c.sqlite3_bind_int64(upd, 1, now) != c.SQLITE_OK) return Error.BindFailed;
-            if (c.sqlite3_bind_int64(upd, 2, existing_id) != c.SQLITE_OK) return Error.BindFailed;
-            if (c.sqlite3_step(upd) != c.SQLITE_DONE) return Error.StepFailed;
-            return false;
-        } else if (step_rc != c.SQLITE_DONE) {
-            return Error.StepFailed;
-        }
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return Error.StepFailed;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
 
-        // Step 3 — no match: insert the new entry. Return true so the daemon
-        // logs it as new. Not wrapped in a txn with step 1 — safe only because
-        // the daemon is the sole writer (single-instance via pidfile lock).
+    /// Insert a text entry. Returns its id.
+    pub fn insertText(
+        self: *Db,
+        content: []const u8,
+        hash: []const u8,
+        now: i64,
+    ) Error!i64 {
         const ins = try self.prepare(
-            "INSERT INTO entries (content, hash, copied_at) VALUES (?, ?, ?);",
+            "INSERT INTO entries (kind, content, hash, copied_at) VALUES ('text', ?, ?, ?);",
         );
         defer _ = c.sqlite3_finalize(ins);
         if (c.sqlite3_bind_text(
@@ -255,7 +289,76 @@ pub const Db = struct {
         ) != c.SQLITE_OK) return Error.BindFailed;
         if (c.sqlite3_bind_int64(ins, 3, now) != c.SQLITE_OK) return Error.BindFailed;
         if (c.sqlite3_step(ins) != c.SQLITE_DONE) return Error.StepFailed;
-        return true;
+        return c.sqlite3_last_insert_rowid(self.handle);
+    }
+
+    /// Insert an image entry plus its `images` row. Returns the entry id.
+    ///
+    /// Wrapped in a transaction, unlike `insertText`: an entries row without
+    /// its images row would satisfy the schema but render as a broken entry
+    /// forever, and there's no second write to repair it.
+    pub fn insertImage(
+        self: *Db,
+        hash: []const u8,
+        now: i64,
+        img: NewImage,
+    ) Error!i64 {
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        const id = blk: {
+            const ins = try self.prepare(
+                "INSERT INTO entries (kind, content, hash, copied_at) VALUES ('image', NULL, ?, ?);",
+            );
+            defer _ = c.sqlite3_finalize(ins);
+            if (c.sqlite3_bind_blob(
+                ins,
+                1,
+                hash.ptr,
+                @intCast(hash.len),
+                SQLITE_STATIC,
+            ) != c.SQLITE_OK) return Error.BindFailed;
+            if (c.sqlite3_bind_int64(ins, 2, now) != c.SQLITE_OK) return Error.BindFailed;
+            if (c.sqlite3_step(ins) != c.SQLITE_DONE) return Error.StepFailed;
+            break :blk c.sqlite3_last_insert_rowid(self.handle);
+        };
+
+        // Columns are named, so this is decoupled from the table's own order —
+        // it just mirrors it for readability.
+        const ins_img = try self.prepare(
+            "INSERT INTO images (entry_id, path, uti, width, height, byte_len, thumb)" ++
+                " VALUES (?, ?, ?, ?, ?, ?, ?);",
+        );
+        defer _ = c.sqlite3_finalize(ins_img);
+        if (c.sqlite3_bind_int64(ins_img, 1, id) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_text(
+            ins_img,
+            2,
+            img.path.ptr,
+            @intCast(img.path.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_text(
+            ins_img,
+            3,
+            img.uti.ptr,
+            @intCast(img.uti.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(ins_img, 4, img.width) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(ins_img, 5, img.height) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(ins_img, 6, img.byte_len) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_blob(
+            ins_img,
+            7,
+            img.thumb.ptr,
+            @intCast(img.thumb.len),
+            SQLITE_STATIC,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_step(ins_img) != c.SQLITE_DONE) return Error.StepFailed;
+
+        try self.exec("COMMIT;");
+        return id;
     }
 
     /// Bump `copied_at` without touching content/hash. Used by `zclip use`
@@ -268,10 +371,16 @@ pub const Db = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return Error.StepFailed;
     }
 
+    // LEFT JOIN, not two queries: image rows are a minority, and the join
+    // keeps one ordered pass over entries. Column order is load-bearing —
+    // `rowToEntry` indexes it positionally.
+    const entry_select =
+        "SELECT e.id, e.kind, e.content, e.copied_at," ++
+        " i.path, i.uti, i.width, i.height, i.byte_len" ++
+        " FROM entries e LEFT JOIN images i ON i.entry_id = e.id";
+
     pub fn getEntries(self: *Db) Error![]Entry {
-        const stmt = try self.prepare(
-            "SELECT id, content, copied_at FROM entries ORDER BY copied_at DESC;",
-        );
+        const stmt = try self.prepare(entry_select ++ " ORDER BY e.copied_at DESC;");
         defer _ = c.sqlite3_finalize(stmt);
         return self.collectEntries(stmt);
     }
@@ -280,10 +389,10 @@ pub const Db = struct {
     /// `tags.name` is COLLATE NOCASE, so the match is case-insensitive.
     pub fn getEntriesByTag(self: *Db, tag: []const u8) Error![]Entry {
         const stmt = try self.prepare(
-            "SELECT e.id, e.content, e.copied_at FROM entries e " ++
-                "JOIN entry_tags et ON et.entry_id = e.id " ++
-                "JOIN tags t ON t.id = et.tag_id " ++
-                "WHERE t.name = ? ORDER BY e.copied_at DESC;",
+            entry_select ++
+                " JOIN entry_tags et ON et.entry_id = e.id" ++
+                " JOIN tags t ON t.id = et.tag_id" ++
+                " WHERE t.name = ? ORDER BY e.copied_at DESC;",
         );
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(
@@ -296,14 +405,14 @@ pub const Db = struct {
         return self.collectEntries(stmt);
     }
 
-    // Drains a prepared SELECT whose columns are (id, content, copied_at) into
-    // an owned slice. Finalizing the stmt stays with the caller.
+    // Drains a prepared `entry_select` into an owned slice. Finalizing the
+    // stmt stays with the caller.
     fn collectEntries(self: *Db, stmt: *c.sqlite3_stmt) Error![]Entry {
         var out: std.ArrayList(Entry) = .empty;
         // errdefer (not defer): on success, caller owns `out` and freeing
         // here would be a use-after-free.
         errdefer {
-            for (out.items) |e| self.allocator.free(e.content);
+            for (out.items) |e| freeEntry(self.allocator, e);
             out.deinit(self.allocator);
         }
 
@@ -312,28 +421,93 @@ pub const Db = struct {
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
-            const id = c.sqlite3_column_int64(stmt, 0);
-            const text_ptr = c.sqlite3_column_text(stmt, 1);
-            const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-            const content = self.allocator.dupe(
-                u8,
-                @as([*]const u8, @ptrCast(text_ptr))[0..text_len],
-            ) catch return Error.OutOfMemory;
-            const copied_at = c.sqlite3_column_int64(stmt, 2);
-
-            out.append(self.allocator, .{
-                .id = id,
-                .content = content,
-                .copied_at = copied_at,
-            }) catch return Error.OutOfMemory;
+            const entry = try self.rowToEntry(stmt);
+            errdefer freeEntry(self.allocator, entry);
+            out.append(self.allocator, entry) catch return Error.OutOfMemory;
         }
 
         return out.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
     }
 
-    /// Fetch one entry's content by id. Caller owns the slice.
-    pub fn getById(self: *Db, id: i64) Error!?[]u8 {
-        const stmt = try self.prepare("SELECT content FROM entries WHERE id = ?;");
+    // Positional decode of one `entry_select` row.
+    fn rowToEntry(self: *Db, stmt: *c.sqlite3_stmt) Error!Entry {
+        const kind_text = (try self.dupeText(stmt, 1)) orelse return Error.StepFailed;
+        defer self.allocator.free(kind_text);
+        // An unknown kind means the DB was written by a newer zclip; failing
+        // is better than silently mis-rendering the row.
+        const kind = std.meta.stringToEnum(Kind, kind_text) orelse return Error.StepFailed;
+
+        const content = try self.dupeText(stmt, 2);
+        errdefer if (content) |ct| self.allocator.free(ct);
+
+        // Columns 4-8 are all NULL for text rows (the LEFT JOIN found no
+        // images row), so only read them when the kind says they're there.
+        const image: ?ImageMeta = if (kind == .image) blk: {
+            const path = (try self.dupeText(stmt, 4)) orelse return Error.StepFailed;
+            errdefer self.allocator.free(path);
+            const uti = (try self.dupeTextZ(stmt, 5)) orelse return Error.StepFailed;
+            break :blk .{
+                .path = path,
+                .uti = uti,
+                .width = c.sqlite3_column_int64(stmt, 6),
+                .height = c.sqlite3_column_int64(stmt, 7),
+                .byte_len = c.sqlite3_column_int64(stmt, 8),
+            };
+        } else null;
+
+        return .{
+            .id = c.sqlite3_column_int64(stmt, 0),
+            .kind = kind,
+            .content = content,
+            .image = image,
+            .copied_at = c.sqlite3_column_int64(stmt, 3),
+        };
+    }
+
+    // Copies a TEXT column out, mapping SQL NULL to Zig null. The pointer
+    // sqlite hands back dies at the next step/finalize, hence the dupe.
+    fn dupeText(self: *Db, stmt: *c.sqlite3_stmt, col: c_int) Error!?[]u8 {
+        if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
+        const ptr = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+        return self.allocator.dupe(
+            u8,
+            @as([*]const u8, @ptrCast(ptr))[0..len],
+        ) catch Error.OutOfMemory;
+    }
+
+    // As `dupeText`, but re-terminates the copy so the result can be handed to
+    // a C API expecting [*:0]const u8. sqlite's own buffer is NUL-terminated,
+    // but `sqlite3_column_bytes` excludes that byte, so a plain dupe wouldn't
+    // be — and an embedded NUL would truncate at the bridge either way.
+    fn dupeTextZ(self: *Db, stmt: *c.sqlite3_stmt, col: c_int) Error!?[:0]u8 {
+        if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
+        const ptr = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+        return self.allocator.dupeSentinel(
+            u8,
+            @as([*]const u8, @ptrCast(ptr))[0..len],
+            0,
+        ) catch Error.OutOfMemory;
+    }
+
+    /// Fetch one entry by id. Caller owns it — free with `freeEntry`.
+    pub fn getEntryById(self: *Db, id: i64) Error!?Entry {
+        const stmt = try self.prepare(entry_select ++ " WHERE e.id = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return Error.BindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return Error.StepFailed;
+        return try self.rowToEntry(stmt);
+    }
+
+    /// Thumbnail PNG bytes for an image entry. Null means only one thing —
+    /// `id` has no `images` row — so callers can report that as an error
+    /// without guessing. Caller owns the slice.
+    pub fn getThumb(self: *Db, id: i64) Error!?[]u8 {
+        const stmt = try self.prepare("SELECT thumb FROM images WHERE entry_id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return Error.BindFailed;
 
@@ -341,11 +515,17 @@ pub const Db = struct {
         if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
-        const text_ptr = c.sqlite3_column_text(stmt, 0);
-        const text_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        // sqlite3_column_blob answers NULL for a zero-length blob, so the
+        // pointer is only castable to a non-optional `[*]const u8` when there
+        // are bytes. An owned empty slice, not null: the row does exist, and
+        // conflating the two made `zclip thumb` claim the entry was missing.
+        if (len == 0) return self.allocator.alloc(u8, 0) catch Error.OutOfMemory;
+
+        const ptr = c.sqlite3_column_blob(stmt, 0);
         return self.allocator.dupe(
             u8,
-            @as([*]const u8, @ptrCast(text_ptr))[0..text_len],
+            @as([*]const u8, @ptrCast(ptr))[0..len],
         ) catch Error.OutOfMemory;
     }
 
@@ -431,10 +611,18 @@ pub const Db = struct {
     }
 };
 
-/// Free an `Entry` slice — both the per-entry `content` buffers and the
-/// slice itself.
+/// Free one `Entry`'s owned strings. Which ones exist depends on `kind`.
+pub fn freeEntry(allocator: std.mem.Allocator, e: Entry) void {
+    if (e.content) |ct| allocator.free(ct);
+    if (e.image) |im| {
+        allocator.free(im.path);
+        allocator.free(im.uti);
+    }
+}
+
+/// Free an `Entry` slice — each entry's owned strings plus the slice itself.
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
-    for (entries) |e| allocator.free(e.content);
+    for (entries) |e| freeEntry(allocator, e);
     allocator.free(entries);
 }
 

@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
     root_mod.linkSystemLibrary("sqlite3", .{});
     root_mod.linkFramework("Foundation", .{});
     root_mod.linkFramework("AppKit", .{});
+    // src/image.zig declares the ImageIO/CoreGraphics/CoreFoundation symbols
+    // by hand (see the header comment there for why translate-c is not used);
+    // these frameworks are what resolve them at link time.
+    root_mod.linkFramework("CoreFoundation", .{});
+    root_mod.linkFramework("CoreGraphics", .{});
+    root_mod.linkFramework("ImageIO", .{});
 
     const exe = b.addExecutable(.{
         .name = "zclip",

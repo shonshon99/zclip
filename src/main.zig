@@ -15,6 +15,7 @@ const usage =
     \\  zclip query [--tag <name>]  Dump entries as a JSON array (optionally one tag)
     \\  zclip tags                Dump all tag names as a JSON array
     \\  zclip use <id>            Put entry <id> back on the pasteboard
+    \\  zclip thumb <id>          Write image <id>'s thumbnail to the cache, print its path
     \\  zclip tag <id> <tag>      Attach one tag to an entry
     \\  zclip untag <id> <tag>    Remove one tag from an entry
     \\
@@ -22,7 +23,7 @@ const usage =
 
 // Commands. Dispatch is one exhaustive switch over the parsed enum,
 // a new variant won't compile until the switch handles it.
-const Command = enum { daemon, use, query, tags, tag, untag };
+const Command = enum { daemon, use, thumb, query, tags, tag, untag };
 
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
 pub fn main(init: std.process.Init) !void {
@@ -59,18 +60,21 @@ pub fn main(init: std.process.Init) !void {
 
     switch (command) {
         .daemon => try daemon.run(alloc, io, environ, out),
-        .use => {
+        .use, .thumb => {
             if (args.len < 3) {
-                try err.writeAll("zclip use: missing <id>\n");
+                try err.print("zclip {s}: missing <id>\n", .{@tagName(command)});
                 try err.flush();
                 std.process.exit(2);
             }
             const id = std.fmt.parseInt(i64, args[2], 10) catch {
-                try err.print("zclip use: invalid id {s}\n", .{args[2]});
+                try err.print("zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
                 try err.flush();
                 std.process.exit(2);
             };
-            try runUse(alloc, environ, io, out, err, id);
+            if (command == .use)
+                try runUse(alloc, environ, io, out, err, id)
+            else
+                try runThumb(alloc, environ, io, out, err, id);
             try out.flush();
         },
         .tag, .untag => {
@@ -127,6 +131,11 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn storageDir(allocator: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
+    const home = environ.getPosix("HOME") orelse return error.MissingHome;
+    return std.fmt.allocPrint(allocator, "{s}/.local/share/zclip", .{home});
+}
+
 // Returns sentinel-0 slice — SQLite's C API needs `const char *`.
 fn dbPath(allocator: std.mem.Allocator, environ: std.process.Environ) ![:0]u8 {
     const home = environ.getPosix("HOME") orelse return error.MissingHome;
@@ -156,14 +165,37 @@ fn runQuery(
         try db.getEntries();
     defer db_mod.freeEntries(allocator, results);
 
-    // Raycast client only needs id + content
-    const JsonEntry = struct { id: i64, content: []const u8 };
+    // One flat shape for both kinds, with the irrelevant half left null and
+    // omitted from the output — so a text row still serialises exactly as it
+    // did before images existed, and clients switch on `kind`.
+    //
+    // The thumbnail BLOB is deliberately absent: base64ing every image into
+    // this array would make a listing that's re-read on each keystroke cost
+    // megabytes. Clients fetch it per-selection via `zclip thumb <id>`.
+    const JsonEntry = struct {
+        id: i64,
+        kind: []const u8,
+        content: ?[]const u8 = null,
+        /// Dimensions of the original, for labels like "Image (1024x1024)".
+        width: ?i64 = null,
+        height: ?i64 = null,
+        /// Original on disk — what `zclip use` puts back on the pasteboard.
+        path: ?[]const u8 = null,
+        byte_len: ?i64 = null,
+    };
+
     const rows = try allocator.alloc(JsonEntry, results.len);
     for (results, rows) |entry, *row| {
-        row.* = .{ .id = entry.id, .content = entry.content };
+        row.* = .{ .id = entry.id, .kind = @tagName(entry.kind), .content = entry.content };
+        if (entry.image) |img| {
+            row.width = img.width;
+            row.height = img.height;
+            row.path = img.path;
+            row.byte_len = img.byte_len;
+        }
     }
 
-    try std.json.Stringify.value(rows, .{}, w);
+    try std.json.Stringify.value(rows, .{ .emit_null_optional_fields = false }, w);
     try w.writeByte('\n');
 }
 
@@ -199,17 +231,113 @@ fn runUse(
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
 
-    const content = (try db.getById(id)) orelse {
+    const entry = (try db.getEntryById(id)) orelse {
         try err.print("zclip use: no entry with id {d}\n", .{id});
         try err.flush();
         std.process.exit(1);
     };
-    defer allocator.free(content);
+    defer db_mod.freeEntry(allocator, entry);
 
     const pb = clipboard.Pasteboard.general();
-    try pb.writeStringAsOrigin(allocator, content);
+
+    // `ok` is AppKit's verdict on the write, carried out of the switch so the
+    // failure is handled once for both kinds — and, critically, *before*
+    // `touch` below. Bumping copied_at for content that never reached the
+    // pasteboard would reorder history around an event that didn't happen.
+    const Written = struct { ok: bool, byte_len: usize };
+    const written: Written = switch (entry.kind) {
+        .text => blk: {
+            // Non-null for .text per the schema's CHECK constraint.
+            const content = entry.content.?;
+            break :blk .{
+                .ok = try pb.writeStringAsOrigin(allocator, content),
+                .byte_len = content.len,
+            };
+        },
+        .image => blk: {
+            const img = entry.image.?;
+
+            // Put back the untouched original, not the thumbnail — the
+            // thumbnail exists only so clients can preview cheaply.
+            const bytes = Io.Dir.cwd().readFileAlloc(io, img.path, allocator, .unlimited) catch {
+                try err.print("zclip use: image file missing: {s}\n", .{img.path});
+                try err.flush();
+                std.process.exit(1);
+            };
+            defer allocator.free(bytes);
+
+            // The stored UTI goes back on the pasteboard verbatim — no lookup,
+            // so a row written by a build that captures more image types than
+            // this one still restores correctly.
+            break :blk .{
+                .ok = pb.writeDataAsOrigin(bytes, img.uti.ptr),
+                .byte_len = bytes.len,
+            };
+        },
+    };
+
+    if (!written.ok) {
+        try err.print("zclip use: pasteboard rejected the write for id {d}\n", .{id});
+        try err.flush();
+        std.process.exit(1);
+    }
+
     try db.touch(id, daemon.unixNow(io));
-    try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, content.len });
+    try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, written.byte_len });
+}
+
+/// Materialise image `id`'s thumbnail into the cache directory and print its
+/// path. Clients render images by path, so the BLOB has to become a file
+/// somewhere; doing it here keeps `query` cheap and the cache regenerable
+/// (deleting it costs one re-run, never data).
+fn runThumb(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    io: Io,
+    w: *Io.Writer,
+    err: *Io.Writer,
+    id: i64,
+) !void {
+    const path = try dbPath(allocator, environ);
+    defer allocator.free(path);
+    var db = try db_mod.Db.open(allocator, path);
+    defer db.close();
+
+    const dir = try storageDir(allocator, environ);
+    defer allocator.free(dir);
+    const cache_dir = try std.fmt.allocPrint(allocator, "{s}/cache", .{dir});
+    defer allocator.free(cache_dir);
+    try Io.Dir.cwd().createDirPath(io, cache_dir);
+
+    // Keyed by rowid. Safe only while nothing deletes entries: SQLite hands
+    // out a recycled rowid after a delete (absent AUTOINCREMENT), so any
+    // future delete/prune path must unlink this file too or the next entry to
+    // land on that id serves the previous one's thumbnail.
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{d}.png", .{ cache_dir, id });
+    defer allocator.free(out_path);
+
+    // An entry's thumbnail never changes, so an existing file is always
+    // current — skip both the BLOB read and the write on repeat calls.
+    // Only a missing file means "not cached yet"; anything else (a permission
+    // problem on the cache dir, say) would otherwise be silently retried on
+    // every call and never reported.
+    if (Io.Dir.cwd().access(io, out_path, .{})) |_| {
+        try w.print("{s}\n", .{out_path});
+        return;
+    } else |access_err| switch (access_err) {
+        error.FileNotFound => {},
+        else => return access_err,
+    }
+
+    const thumb = (try db.getThumb(id)) orelse {
+        try err.print("zclip thumb: no image entry with id {d}\n", .{id});
+        try err.flush();
+        std.process.exit(1);
+    };
+    defer allocator.free(thumb);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = thumb });
+    try w.print("{s}\n", .{out_path});
 }
 
 fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io.Writer, entry_id: i64, tag: []const u8) !void {
