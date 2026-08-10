@@ -47,7 +47,12 @@ function fenced(s: string): string {
   for (const run of s.match(/`+/g) ?? [])
     longest = Math.max(longest, run.length);
   const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${fence}\n${s}\n${fence}`;
+  // Editors put the line terminator on the clipboard when you copy a whole
+  // line, so most code entries already end in \n. The closing fence needs its
+  // own newline, and the two together would render a blank last line — drop
+  // exactly one, never more: further trailing blank lines are real content.
+  const body = s.replace(/\r?\n$/, "");
+  return `${fence}\n${body}\n${fence}`;
 }
 
 // CommonMark angle-bracket link destination. encodeURI escapes spaces but
