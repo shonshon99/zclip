@@ -3,9 +3,29 @@
 Persistent clipboard history daemon for macOS. Zig + libsqlite3 + NSPasteboard.
 
 **User-facing docs (what zclip is, install, every command, JSON schema, exit
-codes) live in [README.md](README.md).** This file is the opposite audience:
-invariants, FFI/ABI gotchas, and version-pinned choices a future session needs
-before touching the code. Forward-looking plans live in the issue tracker.
+codes, schema summary) live in [README.md](README.md).** This file is the
+opposite audience: invariants, FFI/ABI gotchas, and version-pinned choices a
+future session needs before touching the code.
+
+## Commands
+
+```sh
+zig build                    # -> zig-out/bin/zclip
+./tests/run_all.sh           # all suites
+./tests/run_all.sh --safe    # skips clipboard-touching suites (use, daemon, image)
+cd raycast && npx ray build && npx ray lint   # extension checks, NOT run by zig build or run_all.sh
+```
+
+## Conventions
+
+- Branch `feature/<slug>` or `fix/<slug>` off `main`; land via PR merge commit.
+  Don't push to `main` directly.
+- Conventional Commits: `feat:` `fix:` `docs:` `test:` `chore:` `refactor:`
+  `ci:`. Subject only — bodies are rare, reserved for non-obvious why.
+- CI (`.github/workflows/ci.yml`) runs `zig build` + `tests/run_all.sh --safe` on
+  every PR and push to `main`. `macos-latest` is mandatory: the build links
+  AppKit/Foundation and resolves sqlite3 from the Darwin SDK. Zig resolves from
+  `build.zig.zon`'s `minimum_zig_version` — don't hardcode it in the workflow.
 
 ## Layout
 
@@ -17,153 +37,177 @@ src/daemon.zig     Poll loop, pidfile lock (Io.Dir.createFile), signal handlers
 src/image.zig      ImageIO thumbnailing — hand-declared C externs, NOT translate-c
 src/sqlite_c.h     Shim header — `#include <sqlite3.h>` for build-system translate-c
 build.zig          translate-c sqlite3, link AppKit/Foundation/ImageIO/CG/CF; link_libc
-build.zig.zon      minimum_zig_version = "0.16.0"
-.zigversion        0.16.0
-tests/run_all.sh   Runs every suite; --safe skips clipboard-touching ones
-tests/lib.sh       Shared: isolated temp HOME, schema bootstrap, assert helpers
+tests/lib.sh       Shared: isolated temp HOME (fresh mktemp -d per suite), assert helpers
 tests/fixtures/    Committed 1024x768 PNG driving the image suite
-tests/*_test.sh    Per-command suites: tag, untag, query, tags, use, daemon, image
-tools/pbdump.swift Diagnostic: dumps the live pasteboard's flavours + metadata
-raycast/src/zclip.ts    Extension↔CLI boundary: execs the binary, parses its JSON
-raycast/src/search.tsx  "Search Clipboard" — list/detail panes, tag filter, tagging
+tools/pbdump.swift Diagnostic: dumps live pasteboard's flavours + metadata
+raycast/src/zclip.ts        Extension↔CLI boundary: execs the binary, parses its JSON
+raycast/src/search.tsx      "Search Clipboard" — list/detail panes, tag filter, tagging
 raycast/src/run-daemon.tsx  no-view command that starts the daemon
 ```
 
-The Raycast extension is the reference consumer of the CLI's contract — it is
-the reason `query` emits JSON, `thumb` prints a bare path, and `use` exists at
-all. It is a separate npm project (`cd raycast && npm install`); `npx ray build`
-and `npx ray lint` are the checks, and neither runs from `zig build` or
-`tests/run_all.sh`. Changing a command's output shape means changing `zclip.ts`
-in the same commit.
+The Raycast extension is the reference consumer of the CLI's contract — the
+reason `query` emits JSON, `thumb` prints a bare path, and `use` exists at all.
+Changing a command's output shape means changing `zclip.ts` in the same commit.
 
-Each test suite sources `tests/lib.sh`, which sets `HOME` to a fresh `mktemp -d`
-so the real `~/.local/share/zclip` is never touched; `trap cleanup EXIT` removes
-that temp HOME. One throwaway HOME per suite. (How to run: README → Tests.)
+`tools/pbdump.swift` is the evidence behind `image_types`' probe order and the
+text-before-image rule below. Swift because it needs no FFI bindings to maintain.
 
-`tools/pbdump.swift` answers "what did that app *actually* publish?" — run it
-after copying from a given app to see every UTI on the pasteboard with byte
-counts and image dimensions. That's the evidence behind `image_types`' probe
-order and the text-before-image rule below. Not part of the build or the test
-suite; Swift because it needs no FFI bindings to maintain. Output is
-content-free by default so it's safe to paste into an issue; `--text` opts into
-previewing textual flavours.
+## Common tasks
+
+**Adding a subcommand** touches six places:
+
+1. `main.zig`: add the variant to the `Command` enum — dispatch is one exhaustive
+   `switch`, so it won't compile until handled, which is deliberate. Then the
+   `usage` literal and a `run<Name>` fn beside `runQuery`/`runUse`/`runThumb`.
+2. Reuse `storageDir` / `dbPath`. `dbPath` returns a sentinel-0 slice because
+   SQLite's C API needs `const char *`.
+3. Match existing exit codes: 2 = bad invocation, 1 = runtime failure. Tests
+   assert these.
+4. `tests/<cmd>_test.sh` sourcing `tests/lib.sh`, registered in `run_all.sh`'s
+   `suites=()` — inside the `--safe` guard if it touches the real pasteboard, or
+   CI goes flaky.
+5. `README.md`: the `## Commands` block plus a `### zclip <cmd>` section.
+6. `raycast/src/zclip.ts`, only if the extension consumes it.
 
 ## Zig version
 
-Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. The codebase uses 0.16-idiomatic APIs throughout: `pub fn main(init: std.process.Init)`, `std.Io.File.Writer`, `std.Io.Dir.createFile` with advisory lock options, `std.Io.sleep`, `std.Io.Timestamp.now`, `init.minimal.environ.getPosix`. If you bump or downgrade Zig, expect rework in `main.zig` and `daemon.zig` first.
+Pinned to **0.16.0** in both `build.zig.zon` and `.zigversion`. The codebase uses
+0.16-idiomatic APIs throughout: `pub fn main(init: std.process.Init)`,
+`std.Io.File.Writer`, `std.Io.Dir.createFile` with advisory lock options,
+`std.Io.sleep`, `std.Io.Timestamp.now`, `init.minimal.environ.getPosix`. If you
+bump or downgrade Zig, expect rework in `main.zig` and `daemon.zig` first.
 
-Zig is pre-1.0 and breaks meaningful APIs every minor release. Treat any LLM-generated Zig as a draft — compile with the pinned version immediately, cross-check stdlib symbols against the 0.16 release notes, and trust the compiler error over the LLM.
+## Security invariants
 
-## Critical gotchas
+**Concealed-type filter is the only password-leak defense.** Daemon skips entries
+where the pasteboard has `org.nspasteboard.ConcealedType` (1Password, Bitwarden,
+Keychain). If you add a write path or remove the check, sensitive content lands
+in the DB plaintext. Defense-in-depth only — apps that don't set the type (Slack,
+browsers) bypass it.
 
-**Signal handling stays on libc.** `daemon.zig` declares `extern "c" fn signal` and uses raw `SIGINT`/`SIGTERM` constants because `std.posix.sigaction` on Darwin requires a typed-enum handler signature that's awkward to satisfy, and 0.16's Io interface doesn't expose signal handlers. Don't try to "modernize" this without checking the Darwin sigaction prototype first.
+**Origin marker prevents daemon feedback loop.** `zclip use` writes content
+tagged with custom type `dev.zclip.origin`; the poll checks `pb.hasOrigin()` and
+skips. Don't strip this from `writeStringAsOrigin`.
 
-**SQLite C bindings via build-system translate-c, not `@cImport`.** `build.zig` runs `b.addTranslateC` on `src/sqlite_c.h` and exposes the result as `@import("sqlite_c")`. `@cImport` in source files is deprecated in 0.16. Add new SQLite symbols by editing the shim header, not by re-introducing `@cImport`.
+## FFI & runtime gotchas
 
-**SQLite destructor sentinels.** `c.SQLITE_TRANSIENT` and `c.SQLITE_STATIC` are macro-expanded as `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits these as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check at comptime. Workaround in `db.zig`: declare `const SQLITE_STATIC: c.sqlite3_destructor_type = null` and pass null. Safe because all bound buffers outlive `sqlite3_finalize` in our usage.
+**Signal handling stays on libc.** `daemon.zig` declares `extern "c" fn signal`
+and uses raw `SIGINT`/`SIGTERM` because `std.posix.sigaction` on Darwin requires
+a typed-enum handler signature that's awkward to satisfy, and 0.16's Io interface
+doesn't expose signal handlers. Check the Darwin sigaction prototype before
+"modernizing" this.
 
-**ImageIO bindings are hand-written externs — translate-c cannot parse the Apple SDK headers.** `src/image.zig` declares ~20 CF/CG/ImageIO symbols with `extern "c"` instead of following the `sqlite_c.h` + `addTranslateC` convention. Two blockers, in order: CGColorSpace.h writes `CGFloat whitePoint[CG_NONNULL_ARRAY 3]` and clang hard-errors on a nullability specifier inside an array bound (fixable by `#undef`ing the nullability macros in a shim); then CGPath.h declares `typedef void (^CGPathApplyBlock)(...)` unguarded, and blocks need `-fblocks`, which `std.Build.Step.TranslateC` has no API to pass — it exposes include paths and `-D` macros, nothing else. Narrowing the includes doesn't dodge it either; CGPath.h arrives transitively via CGImage.h. Don't "restore consistency" by re-adding a shim header without re-checking those two facts.
+**SQLite C bindings via build-system translate-c, not `@cImport`.** `build.zig`
+runs `b.addTranslateC` on `src/sqlite_c.h` and exposes it as
+`@import("sqlite_c")` (`@cImport` in source is deprecated in 0.16). Add new
+SQLite symbols by editing the shim header.
 
-**CF ownership rules apply in `image.zig`.** "Create"/"Copy" in a CF function name means we own the result and must `CFRelease` it; "Get" means we borrow. `CFDataCreateWithBytesNoCopy` + `kCFAllocatorNull` reads straight out of the Zig slice — every CF object derived from it must die before that slice's owner returns. The options dict passes null callbacks, so it does *not* retain its values; the `CFNumber` must outlive it (defer order handles this).
+**SQLite destructor sentinels.** `SQLITE_TRANSIENT`/`SQLITE_STATIC` expand to
+`((destructor_type)-1)` / `((destructor_type)0)`; translate-c emits
+`@ptrFromInt(...)`, which fails Zig's fn-pointer alignment check at comptime.
+`db.zig` declares `const SQLITE_STATIC: c.sqlite3_destructor_type = null` and
+passes null — safe because all bound buffers outlive `sqlite3_finalize` here.
 
-**Text beats image when the pasteboard offers both.** Rich-text copies publish a TIFF rendering alongside the plain text. The daemon checks `readString` first and only falls through to `imageType()` when there's no non-empty string. Flipping that order turns every copied paragraph into a screenshot.
+**ImageIO bindings are hand-written externs — translate-c cannot parse the Apple
+SDK headers.** Two blockers: CGColorSpace.h writes `CGFloat
+whitePoint[CG_NONNULL_ARRAY 3]` and clang hard-errors on a nullability specifier
+inside an array bound (fixable by `#undef`ing the nullability macros); then
+CGPath.h declares `typedef void (^CGPathApplyBlock)(...)` unguarded, and blocks
+need `-fblocks`, which `std.Build.Step.TranslateC` has no API to pass. Narrowing
+the includes doesn't dodge it — CGPath.h arrives via CGImage.h. Re-check both
+before re-adding a shim header "for consistency".
 
-**`images.path` files are not covered by any cascade.** `entry_tags` cascades on entry delete; the file at `images.path` does not. Any future delete/prune path must unlink the file itself, or `images/` grows forever with orphans.
+**CF ownership rules apply in `image.zig`.** "Create"/"Copy" means we own the
+result and must `CFRelease` it; "Get" means we borrow.
+`CFDataCreateWithBytesNoCopy` + `kCFAllocatorNull` reads straight out of the Zig
+slice, so every CF object derived from it must die before that slice's owner
+returns. The options dict passes null callbacks and so does *not* retain its
+values; the `CFNumber` must outlive it (defer order handles this).
 
-**The `cache/<id>.png` layout is encoded in two places.** `runThumb` in `main.zig` builds it from `storageDir` + rowid; `cachedThumbPath` in `raycast/src/zclip.ts` reconstructs the same string from `homedir()`. The extension does that so an already-materialised thumbnail is discoverable with one `existsSync` instead of a subprocess — that's what lets the list paint row icons in the same frame as the rows, rather than popping them in as `zclip thumb` results arrive. Nothing enforces the two agree, and divergence fails *soft*: every stat misses, the extension silently falls back to `zclip thumb` per row, and the only symptom is the pop-in returning. If you change `storageDir` or the filename convention, grep the extension. Emitting a `thumb_path` field from `query` would collapse this back to one definition, at the cost of a wider JSON contract.
+**Text beats image when the pasteboard offers both.** Rich-text copies publish a
+TIFF rendering alongside the plain text. The daemon checks `readString` first and
+only falls through to `imageType()` when there's no non-empty string. Flipping
+that order turns every copied paragraph into a screenshot.
 
-**Cache filenames are keyed by rowid, which SQLite recycles.** Both `runThumb`'s comment and the extension's stat-based lookup assume `cache/<id>.png` belongs to entry `<id>`. Without `AUTOINCREMENT`, a delete frees that rowid for reuse, so a future prune path must unlink the cache file too — otherwise the next entry to land on the id serves the previous one's thumbnail. Same hazard as `images.path` above, one more place to fix.
+**NSPasteboard goes through `mitchellh/zig-objc`** — `obj.msgSend(Return,
+"selector:", .{args})` synthesizes the `objc_msgSend` cast per call site. Earlier
+revisions hand-rolled the FFI; git history has the reference.
 
-**NSPasteboard goes through `mitchellh/zig-objc`.** `clipboard.zig` calls `objc.getClass("...")` and `obj.msgSend(Return, "selector:", .{args})`. The lib synthesizes the `objc_msgSend` cast per call site from the Return type + args tuple — no per-selector boilerplate needed. Earlier revisions hand-rolled the FFI (extern `objc_msgSend` + `Send*` fn-pointer typedefs + a `msg(comptime T)` ptrCast helper); git history has the reference if you ever need to inline it again.
+**Daemon poll loop wraps each tick in an `objc.AutoreleasePool`.** `[NSString
+stringWithUTF8String:]`, `[pb types]`, `[pb stringForType:]` return autoreleased
+objects; with no pool on the thread they pile up in a process-global one that
+never drains. `readString` copies bytes into the caller's allocator *before* the
+pool drains — don't pass a raw NSString-owned pointer past `defer pool.deinit()`.
 
-**Daemon poll loop wraps each tick in an `objc.AutoreleasePool`.** Methods like `[NSString stringWithUTF8String:]`, `[pb types]`, and `[pb stringForType:]` return autoreleased Obj-C objects. With no pool on the thread they accumulate in a process-global pool that never drains. Pool push/pop per iteration bounds growth. `readString` copies bytes into the caller's allocator *before* the pool drains — don't pass any raw NSString-owned pointer past the `defer pool.deinit()`.
+**WAL mode + single-instance.** `PRAGMA journal_mode=WAL` so CLI reads don't
+block daemon writes. Single instance comes from `.lock = .exclusive,
+.lock_nonblocking = true` on the pidfile's `Io.Dir.createFile` — acquisition is
+atomic with the open(2), contention surfaces as `error.WouldBlock`.
+`truncate = false` preserves the previous PID until `writePid` overwrites via
+`setLength(io, 0)` + `writePositionalAll`.
 
-**Origin marker prevents daemon feedback loop.** `zclip use` writes content tagged with custom type `dev.zclip.origin`. Daemon's poll checks `pb.hasOrigin()` and skips. Don't strip this from `writeStringAsOrigin`.
+**`cache/<id>.png` — two hazards, one filename.** `runThumb` builds it from
+`storageDir` + rowid; `cachedThumbPath` in `zclip.ts` rebuilds it from
+`homedir()`, so a materialised thumbnail is findable with one `existsSync`
+instead of a subprocess — that's what paints row icons in the first frame.
 
-**Concealed-type filter is the only password-leak defense.** Daemon skips entries where pasteboard has `org.nspasteboard.ConcealedType` (1Password/Bitwarden/Keychain). If you add new write paths or remove the check, sensitive content lands in the DB plaintext. This is defense-in-depth only — apps that don't set the type (Slack, browsers pasting from docs) bypass it.
-
-**WAL mode + single-instance.** DB opened with `PRAGMA journal_mode=WAL` so CLI reads don't block daemon writes. Daemon enforces single instance by passing `.lock = .exclusive, .lock_nonblocking = true` to `Io.Dir.createFile` on the pidfile; lock acquisition is atomic with the open(2). Contention surfaces as `error.WouldBlock`. `truncate = false` preserves the previous PID until `writePid` overwrites via `setLength(io, 0)` + `writePositionalAll`.
+- *Divergence fails soft.* Change `storageDir` or the convention and every stat
+  misses: the extension silently falls back to `zclip thumb` per row and the only
+  symptom is icon pop-in. Grep the extension. Emitting `thumb_path` from `query`
+  would collapse this to one definition, at the cost of a wider JSON contract.
+- *Deletes orphan it.* `entry_tags` cascades; `cache/<id>.png` and the file at
+  `images.path` do not. Rowids are recycled without `AUTOINCREMENT`, so a stale
+  cache file serves the *previous* entry's thumbnail to whatever lands on that
+  id. Any future prune path must unlink both.
 
 ## Raycast extension gotchas
 
-Thumbnail loading in `search.tsx` looks over-engineered and is not. Three
-distinct hazards shape it — the first one shipped and had to be chased down, the
-other two were sidestepped during the same work. All three are easy to
-reintroduce by "simplifying".
+Thumbnail loading in `search.tsx` looks over-engineered and is not. Four rules,
+all easy to reintroduce by "simplifying":
 
-**The thumbnail prefetch must never cancel in-flight work.** A thumbnail is
-immutable and keyed by rowid, so a result arriving after a re-render, a tag
-switch, or an unmount is still correct — and React 18 makes `setState` on an
-unmounted component a no-op, so there is nothing to leak. The original version
-cancelled on effect cleanup: any double-invoke (StrictMode on mount, or a tag
-switch mid-prefetch) discarded the running batch while its ids stayed marked in
-the `requested` ref, so nothing re-queued them and exactly `POOL_SIZE` rows kept
-the placeholder icon permanently. The symptom is deceptive: *some* images load
-and which ones varies per launch, which reads like a flaky CLI rather than a
-React lifecycle bug. (It isn't the CLI — 200 concurrent `zclip thumb` calls,
-cold cache and warm, fail zero times.)
+- **The prefetch must never cancel in-flight work.** Thumbnails are immutable and
+  keyed by rowid, so a late result is still correct. Cancelling on effect cleanup
+  meant any double-invoke (StrictMode, or a tag switch mid-prefetch) discarded
+  the running batch while its ids stayed marked in `requested`, so exactly
+  `POOL_SIZE` rows kept the placeholder icon forever. Deceptive symptom: *some*
+  images load, which ones varies per launch — reads like a flaky CLI.
+- **`requested` tracks requested, not in-flight.** Ids stay marked after they
+  resolve. That's what lets the prefetch effect depend on `entries` alone; adding
+  `thumbs` re-enters on every resolution and spawns a fresh pool each time.
+- **Seed the thumb map in the same tick as `setEntries`, computed outside the
+  updater.** React batches both `setState`s into one render, so the first frame
+  with rows already has icons. `seedCachedThumbs` mutates the `requested` ref, so
+  calling it inside the `setThumbs` updater makes the updater impure — StrictMode
+  double-invokes, the second call finds every id marked, returns `{}`, and
+  silently drops the seed.
+- **`zclip thumb` still runs, just off the warm path.** It alone turns the
+  `images.thumb` BLOB into a file, so a never-before-seen image costs one
+  subprocess, once, ever. `query` and `tags` stay one exec per open.
 
-**`requested` tracks requested, not in-flight.** Ids stay marked after they
-resolve. That is what lets the prefetch effect depend on `entries` alone; adding
-`thumbs` to the dep array re-enters on every resolution and spawns a fresh pool
-each time.
+## Schema invariants
 
-**Seed the thumb map in the same tick as `setEntries`, and compute it outside
-the updater.** React batches the two `setState`s into one render, so the first
-frame with rows already has its icons — split across ticks and the pop-in comes
-straight back. `seedCachedThumbs` mutates the `requested` ref, so calling it
-inline inside the `setThumbs` updater would make the updater impure; StrictMode
-double-invokes updaters, the second call finds every id already marked, returns
-`{}`, and silently drops the whole seed.
+Schema summary is in README. What matters when changing it:
 
-**`zclip thumb` still runs, just not on the warm path.** It is the only thing
-that can turn the `images.thumb` BLOB into a file, so a never-before-seen image
-costs one subprocess, once, ever. `query` and `tags` remain one exec each per
-open.
-
-## Schema & migrations
-
-User-facing schema summary is in README. Mechanics and invariants that matter
-when changing it:
-
-```sql
--- v1
-entries(id INTEGER PK, kind TEXT NOT NULL DEFAULT 'text', hash BLOB,
-        copied_at INTEGER, content TEXT NULL)
-  CHECK kind IN ('text','image'); CHECK (kind='text') = (content IS NOT NULL)
-index on hash, index on copied_at
-images(entry_id PK → entries.id ON DELETE CASCADE, path, uti, width, height,
-       byte_len, thumb BLOB)
-  uti = pasteboard type, not a MIME type — the pasteboard is the only producer
-  and only consumer, so `use` hands it straight back to setData:forType:
-  no thumb dimensions column — the PNG's IHDR chunk already carries them
-tags(id INTEGER PK, name TEXT UNIQUE COLLATE NOCASE)
-entry_tags(entry_id → entries.id, tag_id → tags.id, PK(entry_id, tag_id))
-  both FKs ON DELETE CASCADE; index on tag_id
-```
-
-Hash = raw SHA256 (32 bytes) of the copied text, or of the original image bytes. Dedup for both kinds runs through `findByHash`; the daemon `touch`es on a hit and `insertText`/`insertImage`s on a miss, logging each differently. `insertImage` is transactional because a half-written image entry (entries row, no images row) is unrepairable.
-
-The second CHECK is what lets `rowToEntry` trust `kind` and skip reading the joined columns for text rows. `entry_select` in `db.zig` is a LEFT JOIN with a **positional** column list — `rowToEntry` indexes it by number, so reordering the SELECT silently corrupts every read. (Table column order is a separate thing and safe to change: every statement names its columns.)
-
-**The big payload column is declared last in both tables** — `entries.content`, `images.thumb`. A row is one record: header of serial types, then column bodies in declaration order, with anything past the local page payload (~`page_size - 35`, so ~4KB by default) spilling onto overflow pages. Reaching a column means skipping all preceding column bytes, so a small column sitting after a 200KB thumbnail costs an overflow-chain walk per row. Declaring metadata first keeps it on the leaf page. Don't reorder a big BLOB/TEXT to the middle for tidiness.
-
-Images split across two stores on purpose: the original stays on disk at `images/<sha256>.<ext>` (content-addressed, so re-copying never writes twice), and only the 512px PNG thumbnail is a BLOB. Putting multi-MB screenshots in the DB would make every `zclip query` pay for them.
-
-Schema is managed by the `MIGRATIONS` runner in `db.zig` (PRAGMA `user_version`), run from `Db.open` (so CLI and daemon both migrate; idempotent).
-
-**`PRAGMA foreign_keys=ON` is load-bearing for `entry_tags`.** It's per-connection and OFF by default, so `Db.open` runs it *before* `migrate()` (the pragma is a no-op inside the migration runner's `BEGIN IMMEDIATE`). Without it, deleting an entry orphans its `entry_tags` rows instead of cascading. Don't move or drop this.
+- **`entry_select` in `db.zig` is a LEFT JOIN with a positional column list** —
+  `rowToEntry` indexes by number, so reordering the SELECT silently corrupts
+  every read. (Table column order is separate and safe to change: every statement
+  names its columns.)
+- **The `(kind='text') = (content IS NOT NULL)` CHECK** is what lets `rowToEntry`
+  trust `kind` and skip reading the joined columns for text rows.
+- **The big payload column is declared last in both tables** (`entries.content`,
+  `images.thumb`) so metadata stays on the leaf page instead of behind an
+  overflow-chain walk. Don't reorder a big BLOB/TEXT to the middle for tidiness.
+- **`insertImage` is transactional** — a half-written image entry (entries row,
+  no images row) is unrepairable.
+- **`PRAGMA foreign_keys=ON` is load-bearing for `entry_tags`.** Per-connection
+  and OFF by default, so `Db.open` runs it *before* `migrate()` (it's a no-op
+  inside the migration runner's `BEGIN IMMEDIATE`). Without it, deleting an entry
+  orphans `entry_tags` rows instead of cascading. Don't move or drop this.
+- Migrations run from the `MIGRATIONS` runner in `db.zig` (PRAGMA
+  `user_version`), called by `Db.open` so CLI and daemon both migrate; idempotent.
 
 ## Comment style
 
-Concise WHY-comments across all files. Explain non-obvious reasoning: version-pinned API choices, FFI/C ABI constraints, gotchas, security-load-bearing checks, ownership/lifetime contracts. **Don't** explain basic Zig syntax (`try`, `catch`, `defer`, `errdefer`, captures, `anytype`, optional unwrap, slice equality, error unions, format specifiers, `[*c]`/`[*:0]` pointer kinds) — author has internalized those.
-
-## Design principles
-
-- Local-first. Single SQLite file the user fully owns.
-- Daemon stays minimal: poll and insert. Heavy work runs in CLI subcommands triggered out-of-band.
-- WAL mode — CLI reads never block daemon writes.
-- `dev.zclip.origin` marker and `ConcealedType` filter are both load-bearing — don't strip (see gotchas).
-- Schema changes go through the `MIGRATIONS` runner — append-only, never edit a shipped entry.
-- DB growth is unbounded **by design** — permanent retention is the value proposition; auto-eviction intentionally not implemented.
-- Bulk bytes live on disk, derived previews live in the DB. `cache/` is fully regenerable from the DB; `images/` is not — it's the only copy of each original.
+Concise WHY-comments. Explain non-obvious reasoning: version-pinned API choices,
+FFI/C ABI constraints, security-load-bearing checks, ownership/lifetime
+contracts. **Don't** explain basic Zig syntax — the author has internalized it.
