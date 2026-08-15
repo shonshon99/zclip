@@ -11,19 +11,29 @@ const usage =
     \\zclip - persistent clipboard history
     \\
     \\Usage:
-    \\  zclip daemon              Run the polling daemon (foreground)
-    \\  zclip query [--tag <name>]  Dump entries as a JSON array (optionally one tag)
-    \\  zclip tags                Dump all tag names as a JSON array
-    \\  zclip use <id>            Put entry <id> back on the pasteboard
-    \\  zclip thumb <id>          Write image <id>'s thumbnail to the cache, print its path
-    \\  zclip tag <id> <tag>      Attach one tag to an entry
-    \\  zclip untag <id> <tag>    Remove one tag from an entry
+    \\  zclip daemon                                Run the polling daemon (foreground)
+    \\  zclip query [--tag <name>] [--limit <n>]    Dump entries as a JSON array (optionally one tag)
+    \\  zclip tags                                  Dump all tag names as a JSON array
+    \\  zclip use <id>                              Put entry <id> back on the pasteboard
+    \\  zclip thumb <id>                            Write image <id>'s thumbnail to the cache, print its path
+    \\  zclip tag <id> <tag>                        Attach one tag to an entry
+    \\  zclip untag <id> <tag>                      Remove one tag from an entry
     \\
 ;
 
 // Commands. Dispatch is one exhaustive switch over the parsed enum,
 // a new variant won't compile until the switch handles it.
 const Command = enum { daemon, use, thumb, query, tags, tag, untag };
+
+const QueryFlag = enum {
+    tag,
+    limit,
+
+    pub fn fromArg(arg: []const u8) ?QueryFlag {
+        if (!std.mem.startsWith(u8, arg, "--")) return null;
+        return std.meta.stringToEnum(QueryFlag, arg[2..]);
+    }
+};
 
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
 pub fn main(init: std.process.Init) !void {
@@ -106,23 +116,49 @@ pub fn main(init: std.process.Init) !void {
                 try runUntag(alloc, environ, err, id, tag);
         },
         .query => {
-            if (args.len == 2) {
-                try runQuery(alloc, environ, out, null);
-                try out.flush();
-                return;
+            var tagValue: ?[]const u8 = null;
+            var limitValue: ?u32 = null;
+
+            var index: usize = 2;
+            while (index < args.len) : (index += 2) {
+                const flag = QueryFlag.fromArg(args[index]) orelse {
+                    try err.print("zclip {s}: unknown flag {s} provided\n", .{ @tagName(command), args[index] });
+                    try err.flush();
+                    std.process.exit(2);
+                };
+
+                if (index + 1 >= args.len) {
+                    try err.print("zclip {s}: missing value for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
+                    try err.flush();
+                    std.process.exit(2);
+                }
+
+                switch (flag) {
+                    .tag => {
+                        if (tagValue != null) {
+                            try err.print("zclip {s}: multiple values for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
+                            try err.flush();
+                            std.process.exit(2);
+                        }
+                        tagValue = std.mem.trim(u8, args[index + 1], " \t\r\n");
+                    },
+                    .limit => {
+                        if (limitValue != null) {
+                            try err.print("zclip {s}: multiple values for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
+                            try err.flush();
+                            std.process.exit(2);
+                        }
+                        limitValue = std.fmt.parseInt(u32, args[index + 1], 10) catch {
+                            try err.print("zclip {s}: invalid limit {s}\n", .{ @tagName(command), args[index + 1] });
+                            try err.flush();
+                            std.process.exit(2);
+                        };
+                    },
+                }
             }
 
-            // Only `--tag <name>` is accepted: exactly one flag taking one value.
-            if (args.len == 4 and std.mem.eql(u8, args[2], "--tag")) {
-                // Trim to match stored names: tag/untag trim before insert
-                try runQuery(alloc, environ, out, std.mem.trim(u8, args[3], " \t\r\n"));
-                try out.flush();
-                return;
-            }
-
-            try err.writeAll("zclip query: usage: zclip query [--tag <name>]\n");
-            try err.flush();
-            std.process.exit(2);
+            try runQuery(alloc, environ, out, tagValue, limitValue);
+            try out.flush();
         },
         .tags => {
             try runTags(alloc, environ, out);
@@ -152,6 +188,7 @@ fn runQuery(
     environ: std.process.Environ,
     w: *Io.Writer,
     tag: ?[]const u8,
+    _: ?u32,
 ) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
