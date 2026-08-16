@@ -43,8 +43,7 @@ reset_db
 assert_exit 2 "missing <id> → exit 2"   -- "$ZCLIP" use
 assert_exit 2 "non-numeric id → exit 2" -- "$ZCLIP" use abc
 
-# Note: the origin-type tag (dev.zclip.origin) written by `use` is a custom
-# pasteboard UTI not readable from the shell. Its effect — the daemon skipping
-# its own writes — is verified end-to-end in daemon_test.sh instead.
+# dev.zclip.origin is a custom pasteboard UTI, unreadable from the shell. Its
+# effect — the daemon skipping its own writes — is covered in daemon_test.sh.
 
 finish

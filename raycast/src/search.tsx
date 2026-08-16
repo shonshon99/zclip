@@ -23,64 +23,55 @@ import {
   use,
 } from "./zclip";
 
-// Sentinel dropdown value meaning "no tag filter" — empty string would be a
-// valid tag name to zclip, so use a value tags can't take.
+// "No tag filter". Not "" — that's a value zclip would accept as a tag name.
 const ALL_TAGS = "__all__";
 
-// Namespaces the synthetic "create this tag" dropdown item. A raw typed string
-// is indistinguishable from a real tag's value, so the prefix is what tells
-// submit() which branch it's in.
+// Namespaces the synthetic "create this tag" item; the prefix is what tells
+// submit() which branch it's in, since a raw typed string looks like a real tag.
 const NEW_TAG = "__new__:";
 
-// Concurrent `zclip thumb` subprocesses during the prefetch below. Small on
-// purpose: each one is a process spawn plus an ImageIO decode, and saturating
-// the CPU here would stall the list's own rendering.
+// Concurrent `zclip thumb` subprocesses in the prefetch below. Small: each is a
+// spawn plus an ImageIO decode, and saturating the CPU stalls list rendering.
 const POOL_SIZE = 4;
 
-// Resolved state of one entry's thumbnail. Absent from the map means "not
-// fetched yet", which is what drives the detail pane's loading spinner.
+// Absent from the thumb map means "not fetched yet", which drives the detail
+// pane's loading spinner.
 type ThumbState = { path: string } | { error: string };
 
-// Collapses every whitespace run (newlines included) so a multi-line entry
-// still occupies exactly one row in the left pane. The *whole* collapsed string
-// goes into the title: Raycast clips it to the pane and draws the ellipsis
-// itself, so the cut tracks the real pane width — which no constant here could,
-// since the width moves with the window size and the detail split.
+// Collapses whitespace runs so a multi-line entry occupies one row. The whole
+// collapsed string goes into the title: Raycast clips and ellipsises it against
+// the real pane width, which moves with the window and no constant could track.
 function oneLine(s: string): string {
   const collapsed = s.replace(/\s+/g, " ").trim();
   // Raycast warns on an empty title; a whitespace-only entry collapses to "".
   return collapsed || "(whitespace)";
 }
 
-// Fences content for the detail pane so it renders verbatim rather than as
-// markdown — a copied "# heading" or table stays what's actually on the
-// clipboard. The fence is one backtick longer than the longest run inside the
-// content, otherwise copied markdown containing ``` would close it early and
-// spill the rest out as rendered markup.
+// Renders detail-pane content verbatim rather than as markdown, so a copied
+// "# heading" stays what's on the clipboard. The fence runs one backtick longer
+// than the longest run inside, or copied ``` would close it early and spill the
+// rest out as markup.
 function fenced(s: string): string {
   let longest = 0;
   for (const run of s.match(/`+/g) ?? [])
     longest = Math.max(longest, run.length);
   const fence = "`".repeat(Math.max(3, longest + 1));
-  // Editors put the line terminator on the clipboard when you copy a whole
-  // line, so most code entries already end in \n. The closing fence needs its
-  // own newline, and the two together would render a blank last line — drop
-  // exactly one, never more: further trailing blank lines are real content.
+  // Copying a whole line takes its terminator too, so most code entries end in
+  // \n and would render a blank last line above the closing fence. Drop exactly
+  // one — further trailing blank lines are real content.
   const body = s.replace(/\r?\n$/, "");
   return `${fence}\n${body}\n${fence}`;
 }
 
-// CommonMark angle-bracket link destination. encodeURI escapes spaces but
-// leaves parentheses alone, and a bare "(" in $HOME would otherwise terminate
-// an ![](…) destination early.
+// CommonMark angle-bracket destination: encodeURI escapes spaces but not
+// parens, and a bare "(" in $HOME would end an ![](…) destination early.
 function fileUrl(p: string): string {
   return `<file://${encodeURI(p)}>`;
 }
 
-// Resolves every thumbnail that's already on disk, synchronously, so the first
-// render can carry its icons instead of popping them in one subprocess result
-// at a time. Marks each hit in `seen` — that's what keeps the prefetch below
-// from re-fetching a thumbnail we just proved exists.
+// Resolves every already-on-disk thumbnail synchronously, so the first render
+// carries its icons instead of popping them in one subprocess at a time. Marks
+// each hit in `seen`, which keeps the prefetch below from re-fetching them.
 function seedCachedThumbs(
   rows: Entry[],
   seen: Set<number>,
@@ -104,14 +95,12 @@ function detailMarkdown(entry: Entry, state: ThumbState | undefined): string {
   return `![](${fileUrl(state.path)})`;
 }
 
-// One form serves both tag and untag, but the input differs by mode.
+// One form, two inputs:
 //
-// add:    a searchable dropdown over the live tag list, plus a synthetic
-//         Create "…" item when the typed text matches no existing tag — picking
-//         beats retyping, and typos can't silently spawn near-duplicate tags.
-// remove: still free text. `zclip query` exposes no per-entry tag membership,
-//         so we can't know which tags *this* entry carries; a dropdown of all
-//         tags would offer removals that are no-ops.
+// add:    dropdown over the live tag list plus a synthetic Create "…" item, so
+//         a typo can't silently spawn a near-duplicate tag.
+// remove: free text. `zclip query` exposes no per-entry tag membership, so a
+//         dropdown would offer removals that are no-ops.
 function TagForm({
   entry,
   mode,
@@ -128,9 +117,8 @@ function TagForm({
   const [searchText, setSearchText] = useState("");
   const [selected, setSelected] = useState("");
 
-  // Match zclip's own normalization (it trims + lowercases before storing) so
-  // typing "Work" resolves to the existing `work` instead of offering to
-  // create a second one.
+  // Match zclip's normalization (trim + lowercase) so typing "Work" resolves
+  // to the existing `work` instead of offering to create a second one.
   const typed = searchText.trim().toLowerCase();
   const showCreate =
     mode === "add" && typed.length > 0 && !tagList.includes(typed);
@@ -142,7 +130,7 @@ function TagForm({
         : selected.startsWith(NEW_TAG)
           ? selected.slice(NEW_TAG.length)
           : // Falls back to the raw search text for the window where the
-            // dropdown re-selected but onChange hasn't landed yet.
+            // dropdown re-selected but onChange hasn't landed.
             selected || searchText
     ).trim();
     if (!name) {
@@ -160,7 +148,7 @@ function TagForm({
         title: `${past} #${entry.id}`,
         message: name,
       });
-      onMutated(); // refresh dropdown + entries in the parent list
+      onMutated(); // refreshes the parent list's dropdown + entries
       pop();
     } catch (err) {
       await showToast({
@@ -180,13 +168,11 @@ function TagForm({
       }
     >
       {mode === "add" ? (
-        // No controlled `value`: the Create item's value changes on every
-        // keystroke, so a pinned value would go stale and Raycast would warn
-        // about a selection that isn't in the item list.
-        //
-        // `filtering` is forced true because passing onSearchTextChange
-        // implicitly turns it off — we still want native fuzzy matching over
-        // the real tags, and only use the text to build the Create item.
+        // No controlled `value`: the Create item's value changes per keystroke,
+        // so a pinned one goes stale and Raycast warns about a selection that
+        // isn't in the list. `filtering` is forced on because passing
+        // onSearchTextChange implicitly turns it off, and the native fuzzy
+        // match over real tags is still wanted.
         <Form.Dropdown
           id="name"
           title="Tag"
@@ -225,16 +211,15 @@ export default function Command() {
   const [tagList, setTagList] = useState<string[]>([]);
   const [selectedTag, setSelectedTag] = useState<string>(ALL_TAGS);
   const [loading, setLoading] = useState(true);
-  // Bumped after a tag/untag so both fetches below re-run (new tag may need to
-  // appear in the dropdown; current tag's entry set may have changed).
+  // Bumped after a tag/untag so both fetches below re-run.
   const [revision, setRevision] = useState(0);
-  // Never cleared on a revision bump: an entry's thumbnail is immutable, and
-  // `zclip thumb` is keyed by the same rowid.
+  // Never cleared on a revision bump: thumbnails are immutable and keyed by
+  // rowid.
   const [thumbs, setThumbs] = useState<Record<number, ThumbState>>({});
   // A ref, not state, so a second render can't slip a duplicate exec past the
-  // guard before the first one's setThumbs lands. Tracks *requested*, not
-  // in-flight: entries already resolved into `thumbs` must stay marked, or the
-  // effect below would re-queue them on its next run.
+  // guard before the first setThumbs lands. Tracks *requested*, not in-flight:
+  // resolved ids stay marked, which is what lets the prefetch effect below
+  // depend on `entries` alone.
   const requested = useRef(new Set<number>());
 
   // (Re)load the tag list for the dropdown.
@@ -244,21 +229,18 @@ export default function Command() {
       .catch(() => undefined);
   }, [revision]);
 
-  // Re-fetch entries whenever the selected tag changes — this is the only
-  // server-side narrowing (`zclip query --tag`). It runs on tag change, NOT
-  // per keystroke: the <List> below still filters the loaded set in-memory.
+  // Runs on tag change, not per keystroke: `--tag` is the only server-side
+  // narrowing, and the <List> below filters the loaded set in-memory.
   useEffect(() => {
     setLoading(true);
     query(selectedTag === ALL_TAGS ? undefined : selectedTag)
       .then((rows) => {
-        // Seeded outside the updater on purpose: seedCachedThumbs mutates
-        // `requested`, and StrictMode double-invokes updater functions. Called
-        // inline, the second invocation would find every id already marked,
-        // return {}, and silently drop the whole seed.
+        // Seeded outside the updater: seedCachedThumbs mutates `requested`, and
+        // StrictMode double-invokes updaters — inline, the second call would
+        // find every id marked, return {}, and drop the whole seed.
         const seeded = seedCachedThumbs(rows, requested.current);
-        // Both setStates land in one tick, so React batches them into a single
-        // render and the first frame showing rows already shows their icons.
-        // Split these across ticks and the pop-in comes straight back.
+        // Same tick, so React batches one render and the first frame with rows
+        // already has icons. Split across ticks and the pop-in comes back.
         setThumbs((m) => ({ ...m, ...seeded }));
         setEntries(rows);
       })
@@ -272,18 +254,12 @@ export default function Command() {
       .finally(() => setLoading(false));
   }, [selectedTag, revision]);
 
-  // Materialise the thumbnails the seed above *couldn't* resolve — an image
-  // copied since the last open, or a first run against a cold cache. Everything
-  // already on disk was marked in `requested` before the first paint, so in the
-  // steady state this queue is empty and no subprocess runs at all.
-  //
-  // Bounded pool because each `zclip thumb` is a subprocess and the archive is
-  // unbounded by design. Only the first pass over a given entry actually
-  // renders; zclip short-circuits on an existing cache file after that.
+  // Materialises what the seed above couldn't — an image copied since the last
+  // open, or a cold cache. In the steady state this queue is empty.
   //
   // Depends on `entries` alone, never `thumbs`: resolving one thumbnail
-  // re-renders, and a `thumbs` dep would re-enter here and spawn another full
-  // set of workers each time. `requested` is what makes the queue idempotent.
+  // re-renders, so a `thumbs` dep would re-enter and spawn a fresh pool every
+  // time. `requested` is what makes the queue idempotent.
   useEffect(() => {
     const queue = entries.filter(
       (e) => e.kind === "image" && !requested.current.has(e.id),
@@ -291,14 +267,12 @@ export default function Command() {
     if (queue.length === 0) return;
     for (const e of queue) requested.current.add(e.id);
 
-    // No cancellation on cleanup, deliberately. A thumbnail is immutable and
-    // keyed by rowid, so a result landing after a re-render, a tag switch, or
-    // an unmount is still correct — and React 18 makes a setState on an
-    // unmounted component a no-op, so there's nothing to leak. Dropping late
-    // results is what broke this before: an effect re-run (StrictMode's
-    // double-invoke, or a tag switch mid-prefetch) discarded the in-flight
-    // batch, and since `requested` already had those ids, nothing re-queued
-    // them — exactly POOL_SIZE rows kept the placeholder icon forever.
+    // Never cancel on cleanup. Thumbnails are immutable and keyed by rowid, so
+    // a late result is still correct, and React 18 no-ops a setState after
+    // unmount. Cancelling is what broke this before: any effect re-run
+    // (StrictMode, a tag switch mid-prefetch) discarded the in-flight batch
+    // while its ids stayed marked in `requested`, so exactly POOL_SIZE rows
+    // kept the placeholder icon forever.
     async function worker() {
       for (let e = queue.shift(); e; e = queue.shift()) {
         const id = e.id;
@@ -306,8 +280,8 @@ export default function Command() {
           const path = await thumb(id);
           setThumbs((m) => ({ ...m, [id]: { path } }));
         } catch (err) {
-          // Stays marked as requested — a thumb that failed once (unlinked
-          // original, bad rowid) fails the same way on every retry.
+          // Stays marked requested — a thumb that failed once (unlinked
+          // original, bad rowid) fails the same way every retry.
           setThumbs((m) => ({ ...m, [id]: { error: String(err) } }));
         }
       }
@@ -316,16 +290,14 @@ export default function Command() {
   }, [entries]);
 
   async function paste(entry: Entry) {
-    // Record the use (bumps recency, writes to pasteboard with origin marker)…
+    // Bumps recency and writes to the pasteboard with the origin marker.
     await use(entry.id).catch(() => undefined);
-    // …then paste the content into the frontmost app and dismiss Raycast.
     // Images have no `content`; Raycast pastes them from the original on disk.
     await Clipboard.paste(
       entry.kind === "text" ? entry.content : { file: entry.path },
     );
-    // Invalidate the fetch so the next time this command opens, the just-used
-    // entry shows at the top (zclip use bumped its copied_at). Guards against
-    // Raycast keeping the command "warm" and skipping a remount.
+    // Invalidate so the just-used entry shows at the top next open — Raycast
+    // may keep the command warm and skip a remount.
     setRevision((r) => r + 1);
     await closeMainWindow();
   }
@@ -366,12 +338,10 @@ export default function Command() {
         return (
           <List.Item
             key={entry.id}
-            // Explicit id so onSelectionChange hands back something we can map
-            // straight back to an entry.
+            // Explicit id so onSelectionChange hands back something mappable.
             id={String(entry.id)}
-            // The thumbnail itself once it lands; Icon.Image is the placeholder
-            // for the window before the prefetch resolves (and permanently for
-            // one that failed).
+            // Icon.Image is the placeholder until the prefetch resolves, and
+            // permanently for one that failed.
             icon={
               state && "path" in state
                 ? { source: state.path, mask: Image.Mask.RoundedRectangle }
@@ -379,9 +349,8 @@ export default function Command() {
                   ? Icon.Image
                   : Icon.Text
             }
-            // The in-memory filter matches on title, so image entries are only
-            // reachable by typing "image" or their dimensions. There is no text
-            // on them to match against.
+            // The in-memory filter matches on title, and images carry no text,
+            // so they're reachable only by typing "image" or their dimensions.
             title={
               entry.kind === "image"
                 ? `Image (${entry.width}x${entry.height})`

@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 #
-# Shared functional-test harness for zclip. Source this from each test file:
+# Shared functional-test harness. Source from each test file:
 #
 #     source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 #
-# Provides: isolated temp HOME (so zclip's DB never touches the real
-# ~/.local/share/zclip), schema bootstrap + entry seeding, assertion helpers,
-# background-daemon tracking, and best-effort clipboard save/restore for the
-# tests that exercise the real NSPasteboard.
+# Provides an isolated temp HOME (so the real ~/.local/share/zclip is never
+# touched), entry seeding, assertions, daemon tracking, and best-effort
+# clipboard save/restore.
 
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZCLIP="$REPO_ROOT/zig-out/bin/zclip"
 FIXTURES="$REPO_ROOT/tests/fixtures"
-# Checked-in 1024x768 PNG. Committed rather than generated so image tests
-# don't depend on which wallpapers/icons a given macOS install happens to
-# ship. Larger than the 512px thumbnail cap on purpose, so a downscale that
-# silently no-ops shows up as a failed dimension assertion.
+# Committed rather than generated, so image tests don't depend on which
+# wallpapers a given macOS install ships. Larger than the 512px thumbnail cap,
+# so a downscale that silently no-ops fails a dimension assertion.
 SAMPLE_PNG="$FIXTURES/sample_1024x768.png"
 
 if [[ ! -x "$ZCLIP" ]]; then
@@ -25,8 +23,8 @@ if [[ ! -x "$ZCLIP" ]]; then
     exit 1
 fi
 
-# Isolated HOME. zclip resolves its DB as $HOME/.local/share/zclip/history.db
-# (main.zig dbPath), so a throwaway HOME fully sandboxes storage.
+# zclip resolves its DB under $HOME (main.zig dbPath), so a throwaway HOME
+# fully sandboxes storage.
 TMP_HOME="$(mktemp -d)"
 export HOME="$TMP_HOME"
 DB="$TMP_HOME/.local/share/zclip/history.db"
@@ -44,17 +42,16 @@ CLIP_BACKUP=""
 # --- cleanup ---------------------------------------------------------------
 
 cleanup() {
-    # Kill any tracked background daemon first so it stops touching the DB.
+    # Daemons first, so they stop touching the DB.
     local pid
     for pid in "${DAEMON_PIDS[@]:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
-    # Restore the user's clipboard if a test stashed it.
     if [[ "$CLIP_SAVED" -eq 1 ]]; then
         printf '%s' "$CLIP_BACKUP" | pbcopy 2>/dev/null
     fi
-    # Remove ONLY the throwaway temp HOME (created by mktemp -d, ours alone).
-    # NEVER widen this to a shared dir like ~/.local.
+    # ONLY the throwaway mktemp -d HOME. NEVER widen this to a shared dir
+    # like ~/.local.
     rm -rf "$TMP_HOME"
 }
 trap cleanup EXIT
@@ -63,11 +60,11 @@ trap cleanup EXIT
 
 # Fresh DB seeded with one known entry (id=1). Each test calls this first.
 reset_db() {
-    # Scope the wipe to zclip's leaf dir only — never the shared .local parent.
+    # Leaf dir only — never the shared .local parent.
     rm -rf "$ZDIR"
     mkdir -p "$ZDIR"
-    # No `zclip add` exists; `query` opens the DB and runs the migration
-    # runner, creating the schema. Then seed entries directly with sqlite3.
+    # There's no `zclip add`; `query` opens the DB, which runs the migrations
+    # and creates the schema. Entries are then seeded with sqlite3 directly.
     "$ZCLIP" query >/dev/null 2>&1
     seed_entry 1 'hello world' 0
 }
@@ -80,9 +77,9 @@ seed_entry() {
 
 # seed_image_entry <id> <path> <copied_at> [width] [height]
 #
-# Fakes what the daemon writes for an image: a content-less entries row plus
-# its images row. The thumb blob is a stand-in, not a real PNG — tests that
-# need decodable pixels go through the daemon and the pasteboard instead.
+# Fakes what the daemon writes: a content-less entries row plus its images row.
+# The thumb blob is a stand-in, not a real PNG — tests needing decodable pixels
+# go through the daemon and the pasteboard instead.
 seed_image_entry() {
     local id="$1" path="$2" ts="$3" w="${4:-1024}" h="${5:-768}"
     sqlite3 "$DB" "
@@ -93,18 +90,16 @@ seed_image_entry() {
     "
 }
 
-# Put a PNG file on the real pasteboard as image data (not as a file
-# reference). «class PNGf» is the four-char code for public.png, which is what
-# the daemon probes for first.
+# Puts a PNG on the real pasteboard as image data, not a file reference.
+# «class PNGf» is the four-char code for public.png, the daemon's first probe.
 copy_image_to_clipboard() {
     osascript -e "set the clipboard to (read (POSIX file \"$1\") as «class PNGf»)" >/dev/null
 }
 
-# query <sql> → prints scalar result
 query() { sqlite3 "$DB" "$1"; }
 
-# png_dims <file> → "<width>|<height>", read out of the image itself. The DB
-# stores no thumbnail dimensions — a PNG carries its own in the IHDR chunk.
+# png_dims <file> → "<width>|<height>", read from the file's own IHDR chunk.
+# The DB stores no thumbnail dimensions.
 png_dims() {
     sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null |
         awk '/pixelWidth/{w=$2} /pixelHeight/{h=$2} END{print w "|" h}'
@@ -144,7 +139,7 @@ assert_exit() {
 
 section() { echo; echo "== $1 =="; }
 
-# finish: print summary, exit nonzero if any test failed (CI-friendly).
+# Summary; exits nonzero if any test failed.
 finish() {
     echo
     echo "-------------------------------------"
@@ -166,10 +161,10 @@ save_clipboard() {
 
 # start_daemon <logfile> → sets global DAEMON_PID, tracks it for cleanup.
 #
-# Sets a global rather than echoing the pid: a `pid="$(start_daemon)"` capture
-# would launch the daemon inside a command-substitution subshell, making it a
-# grandchild the main shell can't `wait` on — `stop_daemon`'s wait would return
-# instantly and race the still-exiting process.
+# A global rather than an echoed pid: `pid="$(start_daemon)"` would launch the
+# daemon in a command-substitution subshell, making it a grandchild the main
+# shell can't `wait` on — stop_daemon would return instantly and race the
+# still-exiting process.
 start_daemon() {
     "$ZCLIP" daemon >"$1" 2>&1 &
     DAEMON_PID=$!

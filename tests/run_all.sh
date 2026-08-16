@@ -6,8 +6,8 @@
 #   ./tests/run_all.sh --safe   # skip suites that touch the real clipboard
 #                                 (use, daemon)
 #
-# Pasteboard-touching suites stash/restore your clipboard, but --safe lets you
-# run in CI or while working without any clipboard interference.
+# Those suites stash/restore your clipboard, but --safe avoids touching it at
+# all — for CI, or for running while you work.
 
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

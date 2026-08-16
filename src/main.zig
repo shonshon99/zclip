@@ -21,8 +21,8 @@ const usage =
     \\
 ;
 
-// Commands. Dispatch is one exhaustive switch over the parsed enum,
-// a new variant won't compile until the switch handles it.
+// Dispatch is one exhaustive switch, so a new variant won't compile until it's
+// handled.
 const Command = enum { daemon, use, thumb, query, tags, tag, untag };
 
 const QueryFlag = enum {
@@ -39,16 +39,9 @@ fn isFlagShaped(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--");
 }
 
-// The two ways a command dies, one per exit code in README's table — the codes
-// the test suites assert on. All `noreturn`, so a call site reads as the end of
-// that path. stderr is best-effort: a failed write must not change the code, so
-// the print errors are dropped rather than propagated.
-//
-// Exit 2 comes in two shapes because Zig has neither overloading nor default
-// arguments: `failUsageMsg` takes a ready-made string — the `usage` literal —
-// and `failUsage` formats. Routing `usage` through the formatter works, but
-// `{s}`-wrapping it only to have `print` scan it back out is noise at the call
-// site. Exit 1 has no fixed-string caller, so it has only the formatting shape.
+// Exit codes match README's table: 2 = bad invocation, 1 = runtime failure.
+// The test suites assert on both. stderr is best-effort — a failed write must
+// not change the exit code.
 
 /// Bad invocation: unknown command or flag, missing or unparsable argument.
 fn failUsageMsg(w: *Io.Writer, msg: []const u8) noreturn {
@@ -64,9 +57,8 @@ fn failUsage(w: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-/// Runtime failure: the invocation was well-formed, the work behind it wasn't
-/// possible (no such id, missing image file, pasteboard or DB refusal). The id
-/// or path that failed is formatted in.
+/// Runtime failure: well-formed invocation, impossible work (no such id,
+/// missing image file, pasteboard or DB refusal).
 fn failRuntime(w: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn {
     w.print(fmt, args) catch {};
     w.flush() catch {};
@@ -77,7 +69,6 @@ fn failRuntime(w: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    // 0.16 File.Writer: stack buffer + interface pointer for print/writeAll.
     var stdout_buf: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const out = &stdout_file_writer.interface;
@@ -86,8 +77,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
     const err = &stderr_file_writer.interface;
 
-    // Arena: CLI commands are short-lived; one bulk free on exit beats
-    // tracking individual frees.
+    // CLI commands are short-lived; one bulk free on exit beats tracking frees.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -150,9 +140,9 @@ pub fn main(init: std.process.Init) !void {
                 const flag = QueryFlag.fromArg(args[index]) orelse
                     failUsage(err, "zclip {s}: unknown flag {s} provided\n", .{ @tagName(command), args[index] });
 
-                // A flag-shaped token can never be a value: `query --tag --limit 5`
-                // would otherwise bind the tag to the literal "--limit" and exit 0
-                // with an empty array instead of reporting the missing value.
+                // A flag-shaped token is never a value: `query --tag --limit 5`
+                // would otherwise bind the tag to "--limit" and exit 0 with an
+                // empty array instead of reporting the missing value.
                 if (index + 1 >= args.len or isFlagShaped(args[index + 1])) failUsage(
                     err,
                     "zclip {s}: missing value for --{s} flag\n",
@@ -219,13 +209,10 @@ fn runQuery(
         try db.getEntries(limit);
     defer db_mod.freeEntries(allocator, results);
 
-    // One flat shape for both kinds, with the irrelevant half left null and
-    // omitted from the output — so a text row still serialises exactly as it
-    // did before images existed, and clients switch on `kind`.
-    //
-    // The thumbnail BLOB is deliberately absent: base64ing every image into
-    // this array would make a listing that's re-read on each keystroke cost
-    // megabytes. Clients fetch it per-selection via `zclip thumb <id>`.
+    // One flat shape for both kinds; the irrelevant half is null and omitted,
+    // so text rows serialise as they always did and clients switch on `kind`.
+    // No thumbnail BLOB: base64ing every image into a listing that's re-read
+    // per keystroke would cost megabytes. Clients call `zclip thumb <id>`.
     const JsonEntry = struct {
         id: i64,
         kind: []const u8,
@@ -267,7 +254,6 @@ fn runTags(
     const names = try db.getTagNames();
     defer db_mod.freeTagNames(allocator, names);
 
-    // Stringify a []const []const u8 → JSON array of strings; [] when empty.
     try std.json.Stringify.value(names, .{}, w);
     try w.writeByte('\n');
 }
@@ -291,14 +277,13 @@ fn runUse(
 
     const pb = clipboard.Pasteboard.general();
 
-    // `ok` is AppKit's verdict on the write, carried out of the switch so the
-    // failure is handled once for both kinds — and, critically, *before*
-    // `touch` below. Bumping copied_at for content that never reached the
-    // pasteboard would reorder history around an event that didn't happen.
+    // AppKit's verdict, carried out of the switch so failure is handled once
+    // for both kinds — and before `touch`. Bumping copied_at for content that
+    // never reached the pasteboard reorders history around a non-event.
     const Written = struct { ok: bool, byte_len: usize };
     const written: Written = switch (entry.kind) {
         .text => blk: {
-            // Non-null for .text per the schema's CHECK constraint.
+            // Non-null for .text per the schema's CHECK.
             const content = entry.content.?;
             break :blk .{
                 .ok = try pb.writeStringAsOrigin(allocator, content),
@@ -308,15 +293,14 @@ fn runUse(
         .image => blk: {
             const img = entry.image.?;
 
-            // Put back the untouched original, not the thumbnail — the
-            // thumbnail exists only so clients can preview cheaply.
+            // The untouched original, not the thumbnail — that exists only for
+            // cheap previews.
             const bytes = Io.Dir.cwd().readFileAlloc(io, img.path, allocator, .unlimited) catch
                 failRuntime(err, "zclip use: image file missing: {s}\n", .{img.path});
             defer allocator.free(bytes);
 
-            // The stored UTI goes back on the pasteboard verbatim — no lookup,
-            // so a row written by a build that captures more image types than
-            // this one still restores correctly.
+            // Stored UTI goes back verbatim, no lookup, so a row written by a
+            // build that captures more image types still restores correctly.
             break :blk .{
                 .ok = pb.writeDataAsOrigin(bytes, img.uti.ptr),
                 .byte_len = bytes.len,
@@ -330,10 +314,10 @@ fn runUse(
     try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, written.byte_len });
 }
 
-/// Materialise image `id`'s thumbnail into the cache directory and print its
-/// path. Clients render images by path, so the BLOB has to become a file
-/// somewhere; doing it here keeps `query` cheap and the cache regenerable
-/// (deleting it costs one re-run, never data).
+/// Materialise image `id`'s thumbnail into the cache dir and print its path.
+/// Clients render by path, so the BLOB has to become a file somewhere; doing it
+/// here keeps `query` cheap and the cache regenerable (deleting it costs a
+/// re-run, never data).
 fn runThumb(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
@@ -353,18 +337,15 @@ fn runThumb(
     defer allocator.free(cache_dir);
     try Io.Dir.cwd().createDirPath(io, cache_dir);
 
-    // Keyed by rowid. Safe only while nothing deletes entries: SQLite hands
-    // out a recycled rowid after a delete (absent AUTOINCREMENT), so any
-    // future delete/prune path must unlink this file too or the next entry to
-    // land on that id serves the previous one's thumbnail.
+    // Keyed by rowid, which SQLite recycles after a delete (no AUTOINCREMENT),
+    // so any future prune path must unlink this file or the next entry landing
+    // on that id serves the previous one's thumbnail.
     const out_path = try std.fmt.allocPrint(allocator, "{s}/{d}.png", .{ cache_dir, id });
     defer allocator.free(out_path);
 
-    // An entry's thumbnail never changes, so an existing file is always
-    // current — skip both the BLOB read and the write on repeat calls.
-    // Only a missing file means "not cached yet"; anything else (a permission
-    // problem on the cache dir, say) would otherwise be silently retried on
-    // every call and never reported.
+    // A thumbnail never changes, so an existing file is always current. Only
+    // FileNotFound means "not cached yet" — anything else (a permission problem
+    // on the cache dir) must surface instead of being retried forever.
     if (Io.Dir.cwd().access(io, out_path, .{})) |_| {
         try w.print("{s}\n", .{out_path});
         return;

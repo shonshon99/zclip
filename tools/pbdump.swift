@@ -5,16 +5,13 @@
 //   ./tools/pbdump.swift            # type names, byte counts, image dimensions
 //   ./tools/pbdump.swift --text     # also preview textual flavours
 //
-// Answers "what did that app actually publish?" — the question behind every
-// decision in clipboard.zig's `image_types` probe order and daemon.zig's
-// text-before-image fallthrough. Swift rather than Zig on purpose: this is a
-// throwaway diagnostic, and reaching NSPasteboard from Swift costs no FFI
-// bindings to maintain.
+// Answers "what did that app actually publish?" — the evidence behind
+// clipboard.zig's `image_types` probe order and daemon.zig's text-before-image
+// fallthrough. Swift because it needs no FFI bindings to maintain.
 //
-// Default output is deliberately content-free — type names, lengths, and
-// image dimensions only — so it's safe to run against a live clipboard
-// without spilling whatever you last copied into a terminal or a bug report.
-// `--text` opts into previews.
+// Default output is content-free (type names, lengths, dimensions), so it's
+// safe to run against a live clipboard without spilling what you last copied
+// into a terminal or a bug report. `--text` opts into previews.
 
 import AppKit
 import ImageIO
@@ -30,13 +27,13 @@ print("items:       \(items.count)")
 
 // Mirrors `Pasteboard.image_types` in src/clipboard.zig, in the same order.
 let probed = ["public.png", "public.tiff", "public.jpeg"]
-// Types the daemon branches on: the concealed-type opt-out, our own origin
-// marker, and the string flavour that wins over any image.
+// What the daemon branches on: the concealed-type opt-out, our origin marker,
+// and the string flavour that wins over any image.
 let special = ["org.nspasteboard.ConcealedType", "dev.zclip.origin",
                "public.utf8-plain-text"]
 
-// Header-only read: CGImageSource parses metadata without decoding pixels,
-// so a 12MB screenshot costs nothing to inspect.
+// Header-only: CGImageSource reads metadata without decoding pixels, so a 12MB
+// screenshot costs nothing to inspect.
 func imageInfo(_ data: Data) -> String? {
     guard let src = CGImageSourceCreateWithData(data as CFData, nil),
           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil)

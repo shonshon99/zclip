@@ -34,8 +34,8 @@ assert_eq "1024|768" "$(query "SELECT width || '|' || height FROM images;")" \
 assert_eq "true" \
     "$([[ "$(query "SELECT length(thumb) FROM images;")" -gt 0 ]] && echo true || echo false)" \
     "thumbnail blob is non-empty"
-# Decode the stored blob rather than trusting a number we wrote next to it:
-# this proves ImageIO actually downscaled and emitted a valid PNG.
+# Decode the stored blob rather than trusting a number written beside it —
+# proves ImageIO actually downscaled and emitted a valid PNG.
 assert_eq "512|384" \
     "$(png_dims "$("$ZCLIP" thumb "$(query "SELECT id FROM entries WHERE kind='image';")")")" \
     "stored thumbnail is a real PNG, capped at 512px, aspect preserved"
@@ -89,8 +89,8 @@ assert_contains "$out" '"path":"/tmp/zclip-fake.png"' "path to the original pres
 assert_contains "$out" '"kind":"text","content":"hello world"' "text rows unchanged apart from kind"
 
 section "image rows carry no content key, text rows no image keys"
-# emit_null_optional_fields=false — absent, not null, so clients can key off
-# presence without null-checking every field.
+# emit_null_optional_fields=false — absent, not null, so clients key off
+# presence instead of null-checking every field.
 assert_eq "0" "$(printf '%s' "$out" | grep -c '"content":null')" "no null content emitted"
 assert_eq "0" "$(printf '%s' "$out" | grep -c '"width":null')" "no null width emitted"
 
@@ -104,7 +104,7 @@ assert_eq "$(query "SELECT length(thumb) FROM images WHERE entry_id=2;")" \
     "$(stat -f%z "$thumb_path")" "file holds exactly the stored blob"
 
 section "thumb is idempotent and serves the cached file on repeat calls"
-# Blank the blob: a second call that still prints a valid path proves it never
+# Blank the blob: a second call still printing a valid path proves it never
 # went back to the DB.
 sqlite3 "$DB" "UPDATE images SET thumb=x'00' WHERE entry_id=2;"
 assert_eq "$thumb_path" "$("$ZCLIP" thumb 2)" "same path returned"
