@@ -30,10 +30,48 @@ const QueryFlag = enum {
     limit,
 
     pub fn fromArg(arg: []const u8) ?QueryFlag {
-        if (!std.mem.startsWith(u8, arg, "--")) return null;
+        if (!isFlagShaped(arg)) return null;
         return std.meta.stringToEnum(QueryFlag, arg[2..]);
     }
 };
+
+fn isFlagShaped(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "--");
+}
+
+// The two ways a command dies, one per exit code in README's table — the codes
+// the test suites assert on. All `noreturn`, so a call site reads as the end of
+// that path. stderr is best-effort: a failed write must not change the code, so
+// the print errors are dropped rather than propagated.
+//
+// Exit 2 comes in two shapes because Zig has neither overloading nor default
+// arguments: `failUsageMsg` takes a ready-made string — the `usage` literal —
+// and `failUsage` formats. Routing `usage` through the formatter works, but
+// `{s}`-wrapping it only to have `print` scan it back out is noise at the call
+// site. Exit 1 has no fixed-string caller, so it has only the formatting shape.
+
+/// Bad invocation: unknown command or flag, missing or unparsable argument.
+fn failUsageMsg(w: *Io.Writer, msg: []const u8) noreturn {
+    w.writeAll(msg) catch {};
+    w.flush() catch {};
+    std.process.exit(2);
+}
+
+/// Bad invocation, with the offending value formatted into the message.
+fn failUsage(w: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn {
+    w.print(fmt, args) catch {};
+    w.flush() catch {};
+    std.process.exit(2);
+}
+
+/// Runtime failure: the invocation was well-formed, the work behind it wasn't
+/// possible (no such id, missing image file, pasteboard or DB refusal). The id
+/// or path that failed is formatted in.
+fn failRuntime(w: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn {
+    w.print(fmt, args) catch {};
+    w.flush() catch {};
+    std.process.exit(1);
+}
 
 // Zig 0.16: runtime passes a pre-built `Init` with argv, allocator, I/O.
 pub fn main(init: std.process.Init) !void {
@@ -55,32 +93,19 @@ pub fn main(init: std.process.Init) !void {
     const alloc = arena.allocator();
 
     const args = try init.minimal.args.toSlice(alloc);
-    if (args.len < 2) {
-        try err.writeAll(usage);
-        try err.flush();
-        std.process.exit(2);
-    }
+    if (args.len < 2) failUsageMsg(err, usage);
 
     const environ = init.minimal.environ;
-    const command = std.meta.stringToEnum(Command, args[1]) orelse {
-        try err.writeAll(usage);
-        try err.flush();
-        std.process.exit(2);
-    };
+    const command = std.meta.stringToEnum(Command, args[1]) orelse
+        failUsageMsg(err, usage);
 
     switch (command) {
         .daemon => try daemon.run(alloc, io, environ, out),
         .use, .thumb => {
-            if (args.len < 3) {
-                try err.print("zclip {s}: missing <id>\n", .{@tagName(command)});
-                try err.flush();
-                std.process.exit(2);
-            }
-            const id = std.fmt.parseInt(i64, args[2], 10) catch {
-                try err.print("zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
-                try err.flush();
-                std.process.exit(2);
-            };
+            if (args.len < 3) failUsage(err, "zclip {s}: missing <id>\n", .{@tagName(command)});
+
+            const id = std.fmt.parseInt(i64, args[2], 10) catch
+                failUsage(err, "zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
             if (command == .use)
                 try runUse(alloc, environ, io, out, err, id)
             else
@@ -88,24 +113,21 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
         },
         .tag, .untag => {
-            if (args.len != 4) {
-                try err.print("zclip {s}: usage: zclip {s} <id> <tag>\n", .{ @tagName(command), @tagName(command) });
-                try err.flush();
-                std.process.exit(2);
-            }
+            if (args.len != 4) failUsage(
+                err,
+                "zclip {s}: usage: zclip {s} <id> <tag>\n",
+                .{ @tagName(command), @tagName(command) },
+            );
 
-            const id = std.fmt.parseInt(i64, args[2], 10) catch {
-                try err.print("zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
-                try err.flush();
-                std.process.exit(2);
-            };
+            const id = std.fmt.parseInt(i64, args[2], 10) catch
+                failUsage(err, "zclip {s}: invalid id {s}\n", .{ @tagName(command), args[2] });
 
             const trimmed = std.mem.trim(u8, args[3], " \t\r\n");
-            if (trimmed.len == 0) {
-                try err.print("zclip {s}: invalid tag {s}\n", .{ @tagName(command), args[3] });
-                try err.flush();
-                std.process.exit(2);
-            }
+            if (trimmed.len == 0) failUsage(
+                err,
+                "zclip {s}: invalid tag {s}\n",
+                .{ @tagName(command), args[3] },
+            );
 
             const buf = try alloc.alloc(u8, trimmed.len);
             const tag = std.ascii.lowerString(buf, trimmed);
@@ -116,48 +138,43 @@ pub fn main(init: std.process.Init) !void {
                 try runUntag(alloc, environ, err, id, tag);
         },
         .query => {
-            var tagValue: ?[]const u8 = null;
-            var limitValue: ?u32 = null;
+            var tag_value: ?[]const u8 = null;
+            var limit_value: ?u32 = null;
+
+            // Tracks flags, not values: `--tag ""` is a seen flag with an empty
+            // value, and repeating it is still an error.
+            var seen: std.EnumSet(QueryFlag) = .empty;
 
             var index: usize = 2;
             while (index < args.len) : (index += 2) {
-                const flag = QueryFlag.fromArg(args[index]) orelse {
-                    try err.print("zclip {s}: unknown flag {s} provided\n", .{ @tagName(command), args[index] });
-                    try err.flush();
-                    std.process.exit(2);
-                };
+                const flag = QueryFlag.fromArg(args[index]) orelse
+                    failUsage(err, "zclip {s}: unknown flag {s} provided\n", .{ @tagName(command), args[index] });
 
-                if (index + 1 >= args.len) {
-                    try err.print("zclip {s}: missing value for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
-                    try err.flush();
-                    std.process.exit(2);
-                }
+                // A flag-shaped token can never be a value: `query --tag --limit 5`
+                // would otherwise bind the tag to the literal "--limit" and exit 0
+                // with an empty array instead of reporting the missing value.
+                if (index + 1 >= args.len or isFlagShaped(args[index + 1])) failUsage(
+                    err,
+                    "zclip {s}: missing value for --{s} flag\n",
+                    .{ @tagName(command), @tagName(flag) },
+                );
+
+                if (seen.contains(flag)) failUsage(
+                    err,
+                    "zclip {s}: multiple values for --{s} flag\n",
+                    .{ @tagName(command), @tagName(flag) },
+                );
+                seen.insert(flag);
 
                 switch (flag) {
-                    .tag => {
-                        if (tagValue != null) {
-                            try err.print("zclip {s}: multiple values for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
-                            try err.flush();
-                            std.process.exit(2);
-                        }
-                        tagValue = std.mem.trim(u8, args[index + 1], " \t\r\n");
-                    },
-                    .limit => {
-                        if (limitValue != null) {
-                            try err.print("zclip {s}: multiple values for --{s} flag\n", .{ @tagName(command), @tagName(flag) });
-                            try err.flush();
-                            std.process.exit(2);
-                        }
-                        limitValue = std.fmt.parseInt(u32, args[index + 1], 10) catch {
-                            try err.print("zclip {s}: invalid limit {s}\n", .{ @tagName(command), args[index + 1] });
-                            try err.flush();
-                            std.process.exit(2);
-                        };
-                    },
+                    // Trim to match stored names: tag/untag trim before insert.
+                    .tag => tag_value = std.mem.trim(u8, args[index + 1], " \t\r\n"),
+                    .limit => limit_value = std.fmt.parseInt(u32, args[index + 1], 10) catch
+                        failUsage(err, "zclip {s}: invalid limit {s}\n", .{ @tagName(command), args[index + 1] }),
                 }
             }
 
-            try runQuery(alloc, environ, out, tagValue, limitValue);
+            try runQuery(alloc, environ, out, tag_value, limit_value);
             try out.flush();
         },
         .tags => {
@@ -268,11 +285,8 @@ fn runUse(
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
 
-    const entry = (try db.getEntryById(id)) orelse {
-        try err.print("zclip use: no entry with id {d}\n", .{id});
-        try err.flush();
-        std.process.exit(1);
-    };
+    const entry = (try db.getEntryById(id)) orelse
+        failRuntime(err, "zclip use: no entry with id {d}\n", .{id});
     defer db_mod.freeEntry(allocator, entry);
 
     const pb = clipboard.Pasteboard.general();
@@ -296,11 +310,8 @@ fn runUse(
 
             // Put back the untouched original, not the thumbnail — the
             // thumbnail exists only so clients can preview cheaply.
-            const bytes = Io.Dir.cwd().readFileAlloc(io, img.path, allocator, .unlimited) catch {
-                try err.print("zclip use: image file missing: {s}\n", .{img.path});
-                try err.flush();
-                std.process.exit(1);
-            };
+            const bytes = Io.Dir.cwd().readFileAlloc(io, img.path, allocator, .unlimited) catch
+                failRuntime(err, "zclip use: image file missing: {s}\n", .{img.path});
             defer allocator.free(bytes);
 
             // The stored UTI goes back on the pasteboard verbatim — no lookup,
@@ -313,11 +324,7 @@ fn runUse(
         },
     };
 
-    if (!written.ok) {
-        try err.print("zclip use: pasteboard rejected the write for id {d}\n", .{id});
-        try err.flush();
-        std.process.exit(1);
-    }
+    if (!written.ok) failRuntime(err, "zclip use: pasteboard rejected the write for id {d}\n", .{id});
 
     try db.touch(id, daemon.unixNow(io));
     try w.print("copied id={d} ({d} bytes) to pasteboard\n", .{ id, written.byte_len });
@@ -366,11 +373,8 @@ fn runThumb(
         else => return access_err,
     }
 
-    const thumb = (try db.getThumb(id)) orelse {
-        try err.print("zclip thumb: no image entry with id {d}\n", .{id});
-        try err.flush();
-        std.process.exit(1);
-    };
+    const thumb = (try db.getThumb(id)) orelse
+        failRuntime(err, "zclip thumb: no image entry with id {d}\n", .{id});
     defer allocator.free(thumb);
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = thumb });
@@ -384,23 +388,17 @@ fn runTag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io.W
     var db = try db_mod.Db.open(allocator, path);
     defer db.close();
 
-    db.insertTag(tag) catch |e| {
-        try err.print("{s} - Failed to insert tag {s}\n", .{ @errorName(e), tag });
-        try err.flush();
-        std.process.exit(1);
-    };
+    db.insertTag(tag) catch |e|
+        failRuntime(err, "{s} - Failed to insert tag {s}\n", .{ @errorName(e), tag });
 
-    const tag_id = try db.getTagIdByName(tag) orelse {
-        try err.print("Failed to get tag id for tag {s}\n", .{tag});
-        try err.flush();
-        std.process.exit(1);
-    };
+    const tag_id = try db.getTagIdByName(tag) orelse
+        failRuntime(err, "Failed to get tag id for tag {s}\n", .{tag});
 
-    db.insertEntryTag(entry_id, tag_id) catch |e| {
-        try err.print("{s} - Failed to insert entry tag for entry_id {d} and tag_id {d}\n", .{ @errorName(e), entry_id, tag_id });
-        try err.flush();
-        std.process.exit(1);
-    };
+    db.insertEntryTag(entry_id, tag_id) catch |e| failRuntime(
+        err,
+        "{s} - Failed to insert entry tag for entry_id {d} and tag_id {d}\n",
+        .{ @errorName(e), entry_id, tag_id },
+    );
 }
 
 fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io.Writer, entry_id: i64, tag: []const u8) !void {
@@ -411,9 +409,9 @@ fn runUntag(allocator: std.mem.Allocator, environ: std.process.Environ, err: *Io
     defer db.close();
 
     const tag_id = try db.getTagIdByName(tag) orelse return;
-    db.deleteEntryTag(entry_id, tag_id) catch |e| {
-        try err.print("{s} - Failed to delete entry tag for entry_id {d} and tag_id {d}\n", .{ @errorName(e), entry_id, tag_id });
-        try err.flush();
-        std.process.exit(1);
-    };
+    db.deleteEntryTag(entry_id, tag_id) catch |e| failRuntime(
+        err,
+        "{s} - Failed to delete entry tag for entry_id {d} and tag_id {d}\n",
+        .{ @errorName(e), entry_id, tag_id },
+    );
 }

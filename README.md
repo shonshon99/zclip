@@ -131,7 +131,9 @@ server-side text search; it returns rows and the client filters them in memory.
   prints `[]` and exits 0. Omit the flag for no cap.
 
 Flags may be given in either order. Repeating a flag, omitting its value, or
-giving `--limit` a negative or non-numeric argument exits 2.
+giving `--limit` a negative or non-numeric argument exits 2. A value starting
+with `--` counts as omitted, so `--tag --limit 5` is a missing-value error
+rather than a search for a tag named `--limit`.
 
 `id DESC` is a tiebreaker, not a sort key you should depend on for meaning: it
 only decides the order of entries sharing a `copied_at`, so that a given

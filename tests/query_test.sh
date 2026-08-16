@@ -157,5 +157,9 @@ assert_exit 2 "fractional --limit → exit 2"       -- "$ZCLIP" query --limit 1.
 assert_exit 2 "--limit past u32 → exit 2"         -- "$ZCLIP" query --limit 4294967296
 assert_exit 2 "--limit given twice → exit 2"      -- "$ZCLIP" query --limit 1 --limit 2
 assert_exit 2 "--tag given twice → exit 2"        -- "$ZCLIP" query --tag a --tag b
+# A flag-shaped token is never a value: without this rule the tag binds to the
+# literal "--limit" and the command exits 0 with [], hiding the typo.
+assert_exit 2 "--tag eating a flag → exit 2"      -- "$ZCLIP" query --tag --limit 5
+assert_exit 2 "--limit eating a flag → exit 2"    -- "$ZCLIP" query --limit --tag work
 
 finish
