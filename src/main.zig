@@ -188,7 +188,7 @@ fn runQuery(
     environ: std.process.Environ,
     w: *Io.Writer,
     tag: ?[]const u8,
-    _: ?u32,
+    limit: ?u32,
 ) !void {
     const path = try dbPath(allocator, environ);
     defer allocator.free(path);
@@ -197,9 +197,9 @@ fn runQuery(
     defer db.close();
 
     const results = if (tag) |t|
-        try db.getEntriesByTag(t)
+        try db.getEntriesByTag(t, limit)
     else
-        try db.getEntries();
+        try db.getEntries(limit);
     defer db_mod.freeEntries(allocator, results);
 
     // One flat shape for both kinds, with the irrelevant half left null and
