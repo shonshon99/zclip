@@ -2,8 +2,9 @@
 #
 # Functional tests for `zclip query`. Pure DB read — no pasteboard.
 # Emits a minified JSON array of {id, content} objects, newest first
-# (copied_at DESC). `--tag <name>` filters to entries carrying that single
-# tag (no comma-split, no AND). Run: ./tests/query_test.sh (after `zig build`).
+# (copied_at DESC, id DESC). `--tag <name>` filters to entries carrying that
+# single tag (no comma-split, no AND); `--limit <n>` caps the row count and
+# applies after the tag filter. Run: ./tests/query_test.sh (after `zig build`).
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -72,11 +73,89 @@ out="$("$ZCLIP" query --tag nonexistent 2>/dev/null)"
 assert_eq "[]" "$out" "unknown tag → []"
 assert_exit 0 "no-match still exits 0" -- "$ZCLIP" query --tag nonexistent
 
+section "--limit caps the result to the newest N"
+seed_corpus
+out="$("$ZCLIP" query --limit 2 2>/dev/null)"
+assert_eq \
+    '[{"id":3,"kind":"text","content":"third"},{"id":2,"kind":"text","content":"second"}]' \
+    "$out" "newest 2 rows only, copied_at DESC"
+out="$("$ZCLIP" query --limit 1 2>/dev/null)"
+assert_eq '[{"id":3,"kind":"text","content":"third"}]' "$out" \
+    "--limit 1 → the single most recent entry"
+
+section "--limit 0 → empty array, exit 0"
+seed_corpus
+out="$("$ZCLIP" query --limit 0 2>/dev/null)"
+assert_eq "[]" "$out" "zero rows requested → []"
+assert_exit 0 "--limit 0 still exits 0" -- "$ZCLIP" query --limit 0
+
+section "--limit above the row count returns everything"
+seed_corpus
+# Also pins the no-breaking-change guarantee: omitting the flag must equal an
+# effectively-unbounded one.
+unbounded="$("$ZCLIP" query 2>/dev/null)"
+assert_eq "$unbounded" "$("$ZCLIP" query --limit 999999 2>/dev/null)" \
+    "--limit 999999 matches the unbounded result"
+# Smoke test only: a u32 above c_int's range is accepted and round-trips. It
+# can't detect a regression to sqlite3_bind_int — every such value truncates to
+# a negative int, which SQLite reads as unbounded, i.e. the same answer. That
+# regression is caught at compile time instead, since Zig won't narrow u32 to
+# c_int implicitly.
+assert_eq "$unbounded" "$("$ZCLIP" query --limit 4000000000 2>/dev/null)" \
+    "--limit past c_int range still returns every row"
+
+section "copied_at ties break by id DESC, so --limit is deterministic"
+# All three share copied_at, so nothing but the id tiebreaker orders them.
+reset_db
+seed_entry 2 'second' 0
+seed_entry 3 'third'  0
+assert_eq '[{"id":3,"kind":"text","content":"third"}]' \
+    "$("$ZCLIP" query --limit 1 2>/dev/null)" "highest id wins the tie"
+# The assertion that actually bites. Untagged, the plan is a reverse walk of
+# entries_copied_at_idx, whose trailing key is already the rowid — id DESC
+# falls out whether or not the SQL asks, so dropping the tiebreaker can't fail
+# the case above. The tagged plan sorts through a temp b-tree fed in rowid
+# order, where a missing tiebreaker flips this to id=1.
+"$ZCLIP" tag 1 work >/dev/null 2>&1
+"$ZCLIP" tag 2 work >/dev/null 2>&1
+"$ZCLIP" tag 3 work >/dev/null 2>&1
+assert_eq '[{"id":3,"kind":"text","content":"third"}]' \
+    "$("$ZCLIP" query --tag work --limit 1 2>/dev/null)" \
+    "tie broken the same way through the sorter"
+
+section "--limit applies after --tag filtering"
+seed_corpus
+# Tag the two OLDER rows, leaving id=3 untagged: a limit applied before the tag
+# filter would see id=3 first and return [] or the wrong row.
+"$ZCLIP" tag 1 work >/dev/null 2>&1
+"$ZCLIP" tag 2 work >/dev/null 2>&1
+out="$("$ZCLIP" query --tag work --limit 1 2>/dev/null)"
+assert_eq '[{"id":2,"kind":"text","content":"second"}]' "$out" \
+    "newest work-tagged row, not the newest row overall"
+assert_eq "[]" "$("$ZCLIP" query --tag work --limit 0 2>/dev/null)" \
+    "--tag with --limit 0 → []"
+
+section "flag order is irrelevant"
+seed_corpus
+"$ZCLIP" tag 2 work >/dev/null 2>&1
+assert_eq \
+    "$("$ZCLIP" query --tag work --limit 1 2>/dev/null)" \
+    "$("$ZCLIP" query --limit 1 --tag work 2>/dev/null)" \
+    "--tag/--limit and --limit/--tag agree"
+
 section "malformed invocations → exit 2"
 seed_corpus
 assert_exit 2 "--tag with no value → exit 2"      -- "$ZCLIP" query --tag
 assert_exit 2 "unknown positional arg → exit 2"   -- "$ZCLIP" query foo
 assert_exit 2 "extra arg after --tag → exit 2"    -- "$ZCLIP" query --tag work extra
 assert_exit 2 "unknown flag → exit 2"             -- "$ZCLIP" query --kind url
+assert_exit 2 "--limit with no value → exit 2"    -- "$ZCLIP" query --limit
+assert_exit 2 "trailing bare --limit → exit 2"    -- "$ZCLIP" query --tag work --limit
+assert_exit 2 "negative --limit → exit 2"         -- "$ZCLIP" query --limit -1
+assert_exit 2 "non-numeric --limit → exit 2"      -- "$ZCLIP" query --limit abc
+assert_exit 2 "fractional --limit → exit 2"       -- "$ZCLIP" query --limit 1.5
+assert_exit 2 "--limit past u32 → exit 2"         -- "$ZCLIP" query --limit 4294967296
+assert_exit 2 "--limit given twice → exit 2"      -- "$ZCLIP" query --limit 1 --limit 2
+assert_exit 2 "--tag given twice → exit 2"        -- "$ZCLIP" query --tag a --tag b
 
 finish
