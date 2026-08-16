@@ -1,8 +1,6 @@
-//! Polling daemon: every 1s, read NSPasteboard.changeCount, and if it
-//! moved, insert/update the SQLite entry.
-//!
-//! Single-instance enforced via advisory file lock on the pidfile.
-//! SIGINT/SIGTERM trigger a clean shutdown via an atomic flag.
+//! Polling daemon: every 1s, read NSPasteboard.changeCount and insert/update
+//! the SQLite entry if it moved. Single-instance via an advisory lock on the
+//! pidfile; SIGINT/SIGTERM shut down cleanly through an atomic flag.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,20 +13,17 @@ const objc = @import("objc");
 
 const poll_interval: Io.Duration = .fromSeconds(1);
 
-/// Longest side of the stored thumbnail, in pixels. Sized for a Retina
-/// preview pane (~350pt ≈ 700px) without putting megabytes per entry in the
-/// DB; the untouched original stays on disk for `zclip use`.
+/// Longest side of the stored thumbnail, in pixels. Sized for a Retina preview
+/// pane (~350pt ≈ 700px) without putting megabytes per entry in the DB.
 const thumb_max_px: u32 = 512;
 
 // ---- Signal handling --------------------------------------------------------
 
-// Atomic because the signal handler can interrupt the poll loop on the
-// same thread — without atomic ops, reads/writes could tear or be
-// reordered around the load in the while-condition.
+// Atomic because the handler interrupts the poll loop on the same thread:
+// plain reads/writes could tear or reorder around the while-condition's load.
 var running: std.atomic.Value(bool) = .init(true);
 
-// `callconv(.c)` is required because the kernel invokes signal handlers
-// using the platform C ABI, not Zig's internal calling convention.
+// `callconv(.c)`: the kernel invokes signal handlers with the platform C ABI.
 const SigHandler = ?*const fn (c_int) callconv(.c) void;
 extern "c" fn signal(sig: c_int, handler: SigHandler) SigHandler;
 
@@ -45,7 +40,7 @@ fn getpid() i32 {
     return @intCast(std.c.getpid());
 }
 
-/// Unix epoch seconds via the `real` (wall-clock) Io clock.
+/// Unix epoch seconds off the `real` (wall-clock) Io clock.
 pub fn unixNow(io: Io) i64 {
     const ns = Io.Timestamp.now(io, .real).nanoseconds;
     return @intCast(@divTrunc(ns, std.time.ns_per_s));
@@ -58,9 +53,8 @@ fn writePid(file: Io.File, io: Io) !void {
     try file.writePositionalAll(io, s, 0);
 }
 
-/// Main entry point for `zclip daemon`. Verifies storage dir, takes the
-/// pidfile lock, opens SQLite, then enters the poll loop until a signal
-/// flips `running` to false.
+/// Entry point for `zclip daemon`: verify storage dir, take the pidfile lock,
+/// open SQLite, then poll until a signal flips `running` to false.
 pub fn run(
     allocator: std.mem.Allocator,
     io: Io,
@@ -73,8 +67,7 @@ pub fn run(
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/.local/share/zclip", .{home});
     defer allocator.free(dir_path);
 
-    // Deliberately do NOT auto-create the storage dir — print an
-    // actionable hint and bail. User must opt in.
+    // Never auto-create the storage dir — the user must opt in.
     Io.Dir.cwd().access(io, dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             try log_w.print("zclip daemon: storage directory missing: {s}\n", .{dir_path});
@@ -85,9 +78,8 @@ pub fn run(
         else => return err,
     };
 
-    // Subdirectory of a dir the user already opted into, and derived data
-    // rather than the user's DB — so unlike `dir_path` above, creating it is
-    // not a decision to put to the user. Idempotent.
+    // Derived data inside a dir the user already opted into, so unlike
+    // `dir_path` this one is ours to create. Idempotent.
     const images_dir = try std.fmt.allocPrint(allocator, "{s}/images", .{dir_path});
     defer allocator.free(images_dir);
     try Io.Dir.cwd().createDirPath(io, images_dir);
@@ -95,15 +87,13 @@ pub fn run(
     const pid_path = try std.fmt.allocPrint(allocator, "{s}/zclip.pid", .{dir_path});
     defer allocator.free(pid_path);
 
-    // Single-instance gate via flock — an in-memory mutex can't span
-    // processes, so we lock a file both can name; the kernel arbitrates the
-    // shared inode. Any dedicated path works; reusing the pidfile lets one
-    // file serve both the lock and the `kill`/`pgrep` PID readout.
+    // Single-instance gate via flock: a mutex can't span processes, so both
+    // lock a file the kernel arbitrates. Reusing the pidfile lets one file
+    // serve as both lock and `kill`/`pgrep` PID readout.
     //
-    // `.exclusive` + `.lock_nonblocking` takes the flock atomically with
-    // open(2) — no TOCTOU window. `truncate = false` preserves the old PID
-    // until `writePid` overwrites it. OS drops the lock on exit/crash, so no
-    // stale lock blocks a restart.
+    // `.exclusive` + `.lock_nonblocking` takes the lock atomically with open(2)
+    // (no TOCTOU); `truncate = false` keeps the old PID until `writePid`
+    // overwrites it. The OS drops the lock on exit/crash, so none goes stale.
     var pid_file = Io.Dir.cwd().createFile(io, pid_path, .{
         .truncate = false,
         .lock = .exclusive,
@@ -118,11 +108,9 @@ pub fn run(
     };
     defer pid_file.close(io);
 
-    // Write PID into the (already-locked) pidfile so `kill`/`pgrep` can
-    // find this daemon.
     try writePid(pid_file, io);
 
-    // SQLite's C API wants `const char *`; keep the sentinel-0 path here.
+    // Sentinel-0: SQLite's C API wants `const char *`.
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/history.db", .{dir_path}, 0);
     defer allocator.free(db_path);
 
@@ -136,20 +124,17 @@ pub fn run(
     try log_w.flush();
 
     while (running.load(.seq_cst)) {
-        // `.awake` clock — pauses during system suspend on macOS so the
-        // daemon doesn't wake on sleep to find a backlog of changeCount diffs.
+        // `.awake` pauses during system suspend, so waking from sleep doesn't
+        // find a backlog of changeCount diffs.
         Io.sleep(io, poll_interval, .awake) catch |err| switch (err) {
             error.Canceled => break,
         };
         if (!running.load(.seq_cst)) break;
 
-        // Per-tick autorelease pool: Obj-C calls below (`stringWithUTF8String:`,
-        // `[pb types]`, etc.) return autoreleased objects. Without a pool on
-        // this thread they accumulate in a process-global pool that never drains.
-        //
-        // SAFETY: `pb.readString` copies bytes into the caller's allocator
-        // before returning. Don't pass any raw NSString-owned pointer past
-        // the defer below.
+        // The Obj-C calls below return autoreleased objects; with no pool on
+        // this thread they pile up in a process-global one that never drains.
+        // `pb.readString` copies before returning — don't pass any raw
+        // NSString-owned pointer past this defer.
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
@@ -157,8 +142,8 @@ pub fn run(
         if (cc == last_change) continue;
         last_change = cc;
 
-        // nspasteboard.org opt-out markers. Concealed is load-bearing: the
-        // only thing keeping a password manager's clipboard out of the DB.
+        // nspasteboard.org opt-out markers. Concealed is the only thing keeping
+        // a password manager's clipboard out of the DB — don't remove it.
         if (pb.hasConcealed()) {
             try log_w.writeAll("  skip: concealed entry\n");
             try log_w.flush();
@@ -171,12 +156,11 @@ pub fn run(
             continue;
         }
 
-        // Skip our own writes from `zclip use` to prevent a feedback loop.
+        // Skip our own `zclip use` writes — otherwise, feedback loop.
         if (pb.hasOrigin()) continue;
 
-        // Text wins when both are present. Rich-text copies (Word, browsers,
-        // Preview selections) routinely publish a TIFF rendering alongside
-        // the plain text, and the text is what the user meant to copy.
+        // Text wins when both are present: rich-text copies publish a TIFF
+        // rendering alongside the plain text, and the text is what was meant.
         if (try pb.readString(allocator)) |content| {
             defer allocator.free(content);
             if (content.len > 0) {
@@ -200,7 +184,6 @@ fn recordText(io: Io, db: *db_mod.Db, log_w: anytype, content: []const u8) !void
 
     const now: i64 = unixNow(io);
     if (try db.findByHash(&hash)) |id| {
-        // Bump so re-copied content resurfaces as most-recent.
         try db.touch(id, now);
         try log_w.print("  ~ bumped existing entry\n", .{});
     } else {
@@ -211,9 +194,8 @@ fn recordText(io: Io, db: *db_mod.Db, log_w: anytype, content: []const u8) !void
 }
 
 /// Archive the original bytes to `images_dir` and record entry + thumbnail.
-///
-/// Decode failures are logged and swallowed: an image the daemon can't parse
-/// is a skipped clipboard event, not a reason to take down history capture.
+/// Decode failures are logged and swallowed — an unparseable image is a skipped
+/// clipboard event, not a reason to take down history capture.
 fn recordImage(
     allocator: std.mem.Allocator,
     io: Io,
@@ -245,10 +227,8 @@ fn recordImage(
     };
     defer allocator.free(summary.thumb);
 
-    // Content-addressed filename. Dedup already happened by hash above, so
-    // this path is only ever written once per distinct image — and if a
-    // previous run died between file write and insert, the rewrite is
-    // byte-identical.
+    // Content-addressed: dedup above means this path is written once per
+    // distinct image, and a rewrite after a crashed run is byte-identical.
     const path = try std.fmt.allocPrint(allocator, "{s}/{x}.{s}", .{
         images_dir,
         &hash,
@@ -257,12 +237,11 @@ fn recordImage(
     defer allocator.free(path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 
-    // Nothing collects orphans: `images.path` sits outside every FK cascade, so
-    // a file whose insert failed would be referenced by nothing and deleted by
-    // nobody. The insert is the commit point — unwind the file if we don't
-    // reach it. Deliberately a `catch`, not an `errdefer`: an errdefer here
-    // would also fire on a later log-write failure and unlink a file the
-    // committed row points at.
+    // `images.path` sits outside every FK cascade, so a file whose insert
+    // failed is referenced by nothing and collected by nobody. The insert is
+    // the commit point — unwind the file if we don't reach it. A `catch`, not
+    // an `errdefer`: an errdefer would also fire on a later log-write failure
+    // and unlink a file the committed row points at.
     _ = db.insertImage(&hash, now, .{
         .path = path,
         .uti = img_type.uti,

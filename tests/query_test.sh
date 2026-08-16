@@ -91,16 +91,14 @@ assert_exit 0 "--limit 0 still exits 0" -- "$ZCLIP" query --limit 0
 
 section "--limit above the row count returns everything"
 seed_corpus
-# Also pins the no-breaking-change guarantee: omitting the flag must equal an
-# effectively-unbounded one.
+# Pins the no-breaking-change guarantee: omitting the flag equals unbounded.
 unbounded="$("$ZCLIP" query 2>/dev/null)"
 assert_eq "$unbounded" "$("$ZCLIP" query --limit 999999 2>/dev/null)" \
     "--limit 999999 matches the unbounded result"
-# Smoke test only: a u32 above c_int's range is accepted and round-trips. It
-# can't detect a regression to sqlite3_bind_int — every such value truncates to
-# a negative int, which SQLite reads as unbounded, i.e. the same answer. That
-# regression is caught at compile time instead, since Zig won't narrow u32 to
-# c_int implicitly.
+# Smoke test only: proves a u32 above c_int's range round-trips. It can't catch
+# a regression to sqlite3_bind_int — such values truncate to a negative int,
+# which SQLite reads as unbounded, giving the same answer. Zig won't narrow u32
+# to c_int implicitly, so that regression fails at compile time instead.
 assert_eq "$unbounded" "$("$ZCLIP" query --limit 4000000000 2>/dev/null)" \
     "--limit past c_int range still returns every row"
 
@@ -111,11 +109,11 @@ seed_entry 2 'second' 0
 seed_entry 3 'third'  0
 assert_eq '[{"id":3,"kind":"text","content":"third"}]' \
     "$("$ZCLIP" query --limit 1 2>/dev/null)" "highest id wins the tie"
-# The assertion that actually bites. Untagged, the plan is a reverse walk of
-# entries_copied_at_idx, whose trailing key is already the rowid — id DESC
-# falls out whether or not the SQL asks, so dropping the tiebreaker can't fail
-# the case above. The tagged plan sorts through a temp b-tree fed in rowid
-# order, where a missing tiebreaker flips this to id=1.
+# The assertion that bites. Untagged, the plan reverse-walks
+# entries_copied_at_idx, whose trailing key is the rowid — id DESC falls out
+# whether the SQL asks or not, so the case above can't catch a dropped
+# tiebreaker. The tagged plan sorts through a temp b-tree fed in rowid order,
+# where a missing tiebreaker flips this to id=1.
 "$ZCLIP" tag 1 work >/dev/null 2>&1
 "$ZCLIP" tag 2 work >/dev/null 2>&1
 "$ZCLIP" tag 3 work >/dev/null 2>&1

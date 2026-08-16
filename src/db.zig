@@ -2,30 +2,20 @@ const std = @import("std");
 
 pub const c = @import("sqlite_c");
 
-// SQLite's `SQLITE_TRANSIENT` and `SQLITE_STATIC` are macros expanding to
-// `((destructor_type)-1)` and `((destructor_type)0)`. translate-c emits
-// them as `@ptrFromInt(...)` which fails Zig's fn-pointer alignment check
-// at comptime.
-//
-// All bind sites below keep buffers alive past `sqlite3_finalize`, so
-// SQLITE_STATIC semantics hold and we can pass null (SQLite treats null
-// as "caller manages buffer lifetime").
+// translate-c emits SQLITE_STATIC/TRANSIENT as @ptrFromInt, which fails Zig's
+// fn-pointer alignment check. null means the same thing: every bind site here
+// keeps its buffer alive past sqlite3_finalize.
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
-// Ordered schema migrations. MIGRATIONS[i] is the SQL that upgrades the DB
-// from `user_version` i to i+1; the target version is `MIGRATIONS.len`.
+// MIGRATIONS[i] upgrades the DB from `user_version` i to i+1; target is
+// MIGRATIONS.len.
 const MIGRATIONS = [_][]const u8{
     // v1
     //
-    // Column order is deliberate in both tables: the one big payload goes
-    // LAST. A row is stored as a single record (header of serial types, then
-    // column bodies in declaration order), and anything past the local page
-    // payload — roughly page_size minus 35 bytes, so ~4KB by default — spills
-    // onto a chain of overflow pages. Reading a column means skipping every
-    // preceding column's bytes, so a small column declared after a 200KB
-    // thumbnail costs an overflow-chain walk to reach. Keeping all the
-    // fixed-size metadata ahead of `content`/`thumb` means it's readable
-    // straight off the leaf page.
+    // The big payload column goes LAST in both tables. Columns are stored in
+    // declaration order and anything past ~4KB spills to overflow pages, so a
+    // small column declared after a 200KB thumbnail costs a chain walk to
+    // reach. Metadata first means it reads straight off the leaf page.
     \\CREATE TABLE IF NOT EXISTS entries (
     \\  id        INTEGER PRIMARY KEY,
     \\  kind      TEXT NOT NULL DEFAULT 'text',
@@ -74,21 +64,16 @@ pub const Kind = enum { text, image };
 
 /// Image row joined onto an entry. Strings owned by the caller's allocator.
 ///
-/// The pixels live in two places on purpose: the untouched original sits at
-/// `path` on disk (that's what `zclip use` puts back on the pasteboard), while
-/// only the downscaled thumbnail is a BLOB in the DB, so `history.db` stays
-/// small enough that CLI reads remain instant.
+/// Pixels live in two places: the untouched original at `path` on disk (what
+/// `zclip use` restores), and only the thumbnail as a BLOB, so history.db stays
+/// small enough for instant CLI reads.
 pub const ImageMeta = struct {
     path: []u8,
-    /// The pasteboard type the original was captured under (`public.png`,
-    /// `public.tiff`, ...). Stored rather than a MIME type because the
-    /// pasteboard is the only producer and the only consumer: `zclip use`
-    /// hands this straight back to `setData:forType:`, so an unrecognised
-    /// value written by a newer build still round-trips. Sentinel-terminated
-    /// so it can cross to NSString without a re-copy.
+    /// Pasteboard type the original was captured under. Handed straight back to
+    /// `setData:forType:`, so a value written by a newer build still
+    /// round-trips. Sentinel-terminated to cross to NSString without a re-copy.
     uti: [:0]u8,
-    /// Dimensions of the original, not the thumbnail — this is what clients
-    /// render as e.g. "Image (1024x1024)".
+    /// Dimensions of the original, not the thumbnail.
     width: i64,
     height: i64,
     /// Size of the original file at `path`.
@@ -129,31 +114,23 @@ pub const Db = struct {
             return Error.OpenFailed;
         }
         var db: Db = .{ .handle = h.?, .allocator = allocator };
-        // Every step below is fallible. Without this the handle escapes on
-        // those paths, unlike the failed-open branch above which does close.
+        // Every step below is fallible; without this the handle escapes.
         errdefer _ = c.sqlite3_close(db.handle);
 
-        // WAL lets CLI readers run concurrently with daemon writes
-        // instead of serialising through a rollback journal.
+        // WAL so CLI reads don't serialise behind daemon writes.
         try db.exec("PRAGMA journal_mode=WAL;");
-        // synchronous=NORMAL: tiny crash-recovery risk for big throughput.
-        // Fine for clipboard history.
+        // Tiny crash-recovery risk for big throughput. Fine for clipboard history.
         try db.exec("PRAGMA synchronous=NORMAL;");
-        // foreign_keys is per-connection and OFF by default. Required for the
-        // entry_tags ON DELETE CASCADE to fire — without it, deleting an entry
-        // orphans its link rows. Must run before migrate(): the pragma is a
-        // no-op inside a transaction and migrate() opens BEGIN IMMEDIATE.
+        // Per-connection and OFF by default; without it, deleting an entry
+        // orphans its entry_tags rows instead of cascading. Must precede
+        // migrate(): the pragma is a no-op inside its BEGIN IMMEDIATE.
         try db.exec("PRAGMA foreign_keys=ON;");
 
-        // journal_mode/synchronous/foreign_keys are per-connection and re-run
-        // every open; schema lives in the versioned migration runner instead.
-        // Idempotent, so CLI invocations that open the DB are safe even before
-        // the daemon.
+        // Idempotent, so every CLI open is safe even before the daemon runs.
         try db.migrate();
         return db;
     }
 
-    /// Read the current `PRAGMA user_version` (0 on a fresh DB).
     fn userVersion(self: *Db) Error!usize {
         const stmt = try self.prepare("PRAGMA user_version;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -161,38 +138,33 @@ pub const Db = struct {
         return @intCast(c.sqlite3_column_int64(stmt, 0));
     }
 
-    /// Apply every migration above the DB's current `user_version`, each in
-    /// its own transaction, bumping `user_version` after each. No-op when
-    /// already at `MIGRATIONS.len` (idempotent re-runs).
+    /// Apply every migration above the DB's `user_version`, one transaction
+    /// each. No-op when already current.
     fn migrate(self: *Db) Error!void {
-        // Cheap unlocked pre-check: the common case (DB already current, hit
-        // by every CLI open) skips the write lock entirely.
+        // Unlocked pre-check: the common case (already current, every CLI open)
+        // skips the write lock entirely.
         if (try self.userVersion() >= MIGRATIONS.len) return;
 
-        // Re-check the version *inside* each transaction. The pre-check above
-        // is unlocked, so a concurrent opener could advance user_version
-        // between it and BEGIN IMMEDIATE. Reading under the write lock makes
-        // check-then-apply atomic: the process that loses the BEGIN IMMEDIATE
-        // race sees the bumped version and won't re-run a (possibly
-        // non-idempotent) step.
+        // The version is re-read *inside* each transaction because the
+        // pre-check above is unlocked. Reading under the write lock makes
+        // check-then-apply atomic, so the loser of the BEGIN IMMEDIATE race
+        // sees the bumped version instead of re-running a step.
         while (true) {
-            // IMMEDIATE grabs the write lock up front so only one process
-            // applies a step; ROLLBACK on any failure keeps the step atomic.
+            // IMMEDIATE takes the write lock up front; ROLLBACK keeps the step
+            // atomic on failure.
             try self.exec("BEGIN IMMEDIATE;");
             errdefer self.exec("ROLLBACK;") catch {};
 
             const v = try self.userVersion();
             if (v >= MIGRATIONS.len) {
-                // Nothing left (we won nothing, or another process did the
-                // work while we waited for the lock). Release and stop.
+                // Nothing left, or another process did it while we waited.
                 try self.exec("COMMIT;");
                 break;
             }
 
             try self.exec(MIGRATIONS[v]);
 
-            // user_version can't be bound as a parameter — format the literal.
-            // v+1 is the version this step produces; usize, no injection risk.
+            // user_version can't be bound as a parameter. usize, no injection risk.
             var buf: [64]u8 = undefined;
             const sql = std.fmt.bufPrint(
                 &buf,
@@ -235,15 +207,12 @@ pub const Db = struct {
         return stmt.?;
     }
 
-    /// Existing entry id for `hash`, or null. Probing by hash rather than
-    /// content is the dedup key: a 32-byte indexed compare beats scanning a
-    /// possibly-huge TEXT column, and it's the only workable probe for images
-    /// (whose bytes aren't in the DB at all).
+    /// Existing entry id for `hash`, or null. Hash is the dedup key: a 32-byte
+    /// indexed compare beats scanning a huge TEXT column, and it's the only
+    /// probe that works for images (whose bytes aren't in the DB at all).
     ///
-    /// Callers bump `copied_at` via `touch` on a hit so re-copied content
-    /// resurfaces as most-recent, and insert on a miss. Not one transaction:
-    /// safe only because the daemon is the sole writer (single-instance via
-    /// the pidfile lock).
+    /// Callers `touch` on a hit and insert on a miss. Not one transaction —
+    /// safe only because the daemon is the sole writer (pidfile lock).
     pub fn findByHash(self: *Db, hash: []const u8) Error!?i64 {
         const stmt = try self.prepare("SELECT id FROM entries WHERE hash = ? LIMIT 1;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -294,9 +263,9 @@ pub const Db = struct {
 
     /// Insert an image entry plus its `images` row. Returns the entry id.
     ///
-    /// Wrapped in a transaction, unlike `insertText`: an entries row without
-    /// its images row would satisfy the schema but render as a broken entry
-    /// forever, and there's no second write to repair it.
+    /// Transactional, unlike `insertText`: an entries row without its images
+    /// row satisfies the schema but is a broken entry forever — nothing
+    /// repairs it.
     pub fn insertImage(
         self: *Db,
         hash: []const u8,
@@ -323,8 +292,6 @@ pub const Db = struct {
             break :blk c.sqlite3_last_insert_rowid(self.handle);
         };
 
-        // Columns are named, so this is decoupled from the table's own order —
-        // it just mirrors it for readability.
         const ins_img = try self.prepare(
             "INSERT INTO images (entry_id, path, uti, width, height, byte_len, thumb)" ++
                 " VALUES (?, ?, ?, ?, ?, ?, ?);",
@@ -361,8 +328,7 @@ pub const Db = struct {
         return id;
     }
 
-    /// Bump `copied_at` without touching content/hash. Used by `zclip use`
-    /// so the just-used entry surfaces as most recent.
+    /// Bump `copied_at` so the entry resurfaces as most recent.
     pub fn touch(self: *Db, id: i64, now: i64) Error!void {
         const stmt = try self.prepare("UPDATE entries SET copied_at = ? WHERE id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -371,19 +337,18 @@ pub const Db = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return Error.StepFailed;
     }
 
-    // LEFT JOIN, not two queries: image rows are a minority, and the join
-    // keeps one ordered pass over entries. Column order is load-bearing —
-    // `rowToEntry` indexes it positionally.
+    // LEFT JOIN, not two queries: one ordered pass over entries. Reordering
+    // these columns silently corrupts every read — `rowToEntry` indexes them
+    // positionally.
     const entry_select =
         "SELECT e.id, e.kind, e.content, e.copied_at," ++
         " i.path, i.uti, i.width, i.height, i.byte_len" ++
         " FROM entries e LEFT JOIN images i ON i.entry_id = e.id";
 
     /// All entries, newest first. A null `limit` binds -1, which SQLite reads
-    /// as unbounded — that's what lets one prepared statement serve both the
-    /// capped and uncapped call. `e.id DESC` breaks `copied_at` ties so a
-    /// given limit returns the same rows every time; it costs nothing, since
-    /// `entries_copied_at_idx` already carries the rowid as its trailing key.
+    /// as unbounded, so one statement serves both the capped and uncapped call.
+    /// `e.id DESC` breaks `copied_at` ties so a limit returns stable rows; it's
+    /// free, since `entries_copied_at_idx` trails with the rowid anyway.
     pub fn getEntries(self: *Db, limit: ?u32) Error![]Entry {
         const stmt = try self.prepare(
             entry_select ++
@@ -401,11 +366,10 @@ pub const Db = struct {
         return self.collectEntries(stmt);
     }
 
-    /// Entries carrying `tag`, newest first. Same null-limit-means-unbounded
-    /// rule as `getEntries`, but no early exit here: the tag drives the scan,
-    /// so every tagged row is fetched and sorted before the first is emitted.
-    /// The limit only bounds the sorter. `tags.name` is COLLATE NOCASE, so the
-    /// match is case-insensitive.
+    /// Entries carrying `tag`, newest first. Same null-limit rule as
+    /// `getEntries`, but no early exit: the tag drives the scan, so every
+    /// tagged row is fetched and sorted first and the limit only bounds the
+    /// sorter. Match is case-insensitive (`tags.name` is COLLATE NOCASE).
     pub fn getEntriesByTag(self: *Db, tag: []const u8, limit: ?u32) Error![]Entry {
         const stmt = try self.prepare(
             entry_select ++
@@ -432,12 +396,11 @@ pub const Db = struct {
         return self.collectEntries(stmt);
     }
 
-    // Drains a prepared `entry_select` into an owned slice. Finalizing the
-    // stmt stays with the caller.
+    // Drains a prepared `entry_select` into an owned slice. Caller finalizes
+    // the stmt.
     fn collectEntries(self: *Db, stmt: *c.sqlite3_stmt) Error![]Entry {
         var out: std.ArrayList(Entry) = .empty;
-        // errdefer (not defer): on success, caller owns `out` and freeing
-        // here would be a use-after-free.
+        // errdefer, not defer: on success the caller owns `out`.
         errdefer {
             for (out.items) |e| freeEntry(self.allocator, e);
             out.deinit(self.allocator);
@@ -460,15 +423,14 @@ pub const Db = struct {
     fn rowToEntry(self: *Db, stmt: *c.sqlite3_stmt) Error!Entry {
         const kind_text = (try self.dupeText(stmt, 1)) orelse return Error.StepFailed;
         defer self.allocator.free(kind_text);
-        // An unknown kind means the DB was written by a newer zclip; failing
-        // is better than silently mis-rendering the row.
+        // Unknown kind means a newer zclip wrote the DB — fail rather than
+        // mis-render the row.
         const kind = std.meta.stringToEnum(Kind, kind_text) orelse return Error.StepFailed;
 
         const content = try self.dupeText(stmt, 2);
         errdefer if (content) |ct| self.allocator.free(ct);
 
-        // Columns 4-8 are all NULL for text rows (the LEFT JOIN found no
-        // images row), so only read them when the kind says they're there.
+        // Columns 4-8 are NULL for text rows (LEFT JOIN found no images row).
         const image: ?ImageMeta = if (kind == .image) blk: {
             const path = (try self.dupeText(stmt, 4)) orelse return Error.StepFailed;
             errdefer self.allocator.free(path);
@@ -491,8 +453,8 @@ pub const Db = struct {
         };
     }
 
-    // Copies a TEXT column out, mapping SQL NULL to Zig null. The pointer
-    // sqlite hands back dies at the next step/finalize, hence the dupe.
+    // Copies a TEXT column out, SQL NULL → Zig null. Must dupe: sqlite's
+    // pointer dies at the next step/finalize.
     fn dupeText(self: *Db, stmt: *c.sqlite3_stmt, col: c_int) Error!?[]u8 {
         if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
         const ptr = c.sqlite3_column_text(stmt, col);
@@ -503,10 +465,8 @@ pub const Db = struct {
         ) catch Error.OutOfMemory;
     }
 
-    // As `dupeText`, but re-terminates the copy so the result can be handed to
-    // a C API expecting [*:0]const u8. sqlite's own buffer is NUL-terminated,
-    // but `sqlite3_column_bytes` excludes that byte, so a plain dupe wouldn't
-    // be — and an embedded NUL would truncate at the bridge either way.
+    // As `dupeText`, but re-terminates for C APIs wanting [*:0]const u8:
+    // `sqlite3_column_bytes` excludes the NUL, so a plain dupe wouldn't have one.
     fn dupeTextZ(self: *Db, stmt: *c.sqlite3_stmt, col: c_int) Error!?[:0]u8 {
         if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
         const ptr = c.sqlite3_column_text(stmt, col);
@@ -530,9 +490,8 @@ pub const Db = struct {
         return try self.rowToEntry(stmt);
     }
 
-    /// Thumbnail PNG bytes for an image entry. Null means only one thing —
-    /// `id` has no `images` row — so callers can report that as an error
-    /// without guessing. Caller owns the slice.
+    /// Thumbnail PNG bytes for an image entry. Caller owns the slice. Null
+    /// means exactly one thing: `id` has no `images` row.
     pub fn getThumb(self: *Db, id: i64) Error!?[]u8 {
         const stmt = try self.prepare("SELECT thumb FROM images WHERE entry_id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -543,10 +502,10 @@ pub const Db = struct {
         if (rc != c.SQLITE_ROW) return Error.StepFailed;
 
         const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-        // sqlite3_column_blob answers NULL for a zero-length blob, so the
-        // pointer is only castable to a non-optional `[*]const u8` when there
-        // are bytes. An owned empty slice, not null: the row does exist, and
-        // conflating the two made `zclip thumb` claim the entry was missing.
+        // sqlite3_column_blob answers NULL for a zero-length blob, so the cast
+        // below is only valid when there are bytes. Return an empty slice, not
+        // null — the row exists, and conflating the two made `zclip thumb`
+        // report the entry missing.
         if (len == 0) return self.allocator.alloc(u8, 0) catch Error.OutOfMemory;
 
         const ptr = c.sqlite3_column_blob(stmt, 0);
@@ -556,7 +515,7 @@ pub const Db = struct {
         ) catch Error.OutOfMemory;
     }
 
-    /// All tag names, alphabetical. Caller owns the slice and each name
+    /// All tag names, alphabetical. Caller owns the slice and each name.
     pub fn getTagNames(self: *Db) Error![][]u8 {
         const stmt = try self.prepare("SELECT name FROM tags ORDER BY name;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -638,7 +597,6 @@ pub const Db = struct {
     }
 };
 
-/// Free one `Entry`'s owned strings. Which ones exist depends on `kind`.
 pub fn freeEntry(allocator: std.mem.Allocator, e: Entry) void {
     if (e.content) |ct| allocator.free(ct);
     if (e.image) |im| {
@@ -647,13 +605,11 @@ pub fn freeEntry(allocator: std.mem.Allocator, e: Entry) void {
     }
 }
 
-/// Free an `Entry` slice — each entry's owned strings plus the slice itself.
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     for (entries) |e| freeEntry(allocator, e);
     allocator.free(entries);
 }
 
-/// Free a tag-name slice — each name plus the slice.
 pub fn freeTagNames(allocator: std.mem.Allocator, names: [][]u8) void {
     for (names) |n| allocator.free(n);
     allocator.free(names);

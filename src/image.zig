@@ -1,38 +1,29 @@
-//! Pasteboard image bytes → (original dimensions, downscaled PNG thumbnail).
+//! Pasteboard image bytes → (original dimensions, downscaled PNG thumbnail),
+//! via ImageIO's CGImageSource, which decodes and downscales in one pass and
+//! never materialises the full-size bitmap.
 //!
-//! Uses ImageIO's CGImageSource, which decodes and downscales in one pass and
-//! never materialises the full-size bitmap. The AppKit route (NSImage +
-//! NSBitmapImageRep) would need msgSend calls returning NSSize/NSRect structs,
-//! which take the sret ABI path — avoidable risk for no gain.
+//! **The C symbols below are hand-declared, not translate-c'd** — the only
+//! departure from the `src/sqlite_c.h` + `b.addTranslateC` convention, because
+//! the Apple SDK headers don't survive translate-c. Two blockers, check both
+//! before re-adding a shim header "for consistency":
+//!   1. CGColorSpace.h's `CGFloat whitePoint[CG_NONNULL_ARRAY 3]` — clang
+//!      hard-errors on a nullability specifier in an array bound. Fixable by
+//!      `#undef`ing the nullability macros.
+//!   2. CGPath.h's unguarded `typedef void (^CGPathApplyBlock)(...)` needs
+//!      `-fblocks`, and `std.Build.Step.TranslateC` has no API to pass it.
+//!      Narrowing the includes doesn't dodge it — CGPath.h arrives via
+//!      CGImage.h.
 //!
-//! **The C symbols below are declared by hand, not via translate-c.** This is
-//! the one place in the codebase that departs from the `src/sqlite_c.h` +
-//! `b.addTranslateC` convention, because the Apple SDK headers do not survive
-//! translate-c:
-//!   1. CGColorSpace.h writes `CGFloat whitePoint[CG_NONNULL_ARRAY 3]`, and
-//!      clang hard-errors on a nullability specifier inside an array bound.
-//!      Fixable by `#undef`ing the nullability macros in a shim.
-//!   2. CGPath.h then declares `typedef void (^CGPathApplyBlock)(...)`
-//!      unguarded, and blocks require clang's `-fblocks`. Not fixable:
-//!      `std.Build.Step.TranslateC` exposes include paths and `-D` macros and
-//!      nothing else, so the flag cannot be passed. Narrowing the includes
-//!      doesn't help either — CGPath.h arrives transitively via CGImage.h.
-//!
-//! Hand-declaring ~20 symbols also pins exactly what we depend on, so an SDK
-//! bump can't silently change the surface. Frameworks are linked in build.zig.
-//!
-//! CoreFoundation ownership rules govern the rest of the file: a "Create" or
-//! "Copy" in the name means we own the result and must `CFRelease` it; "Get"
-//! means we borrow and must not.
+//! CF ownership rules govern the rest of the file: "Create"/"Copy" means we own
+//! the result and must `CFRelease` it; "Get" means we borrow.
 
 const std = @import("std");
 
 // ---- CoreFoundation / ImageIO FFI -------------------------------------------
 
-// Every CF/CG object is an opaque pointer. Keeping them as bare `anyopaque`
-// aliases (rather than distinct opaque types) is what lets the CFStringRef
-// constants drop straight into the `?*const anyopaque` arrays that
-// CFDictionaryCreate wants, with no @ptrCast at any call site.
+// Bare `anyopaque` aliases rather than distinct opaque types, so the
+// CFStringRef constants drop straight into the `?*const anyopaque` arrays
+// CFDictionaryCreate wants without a @ptrCast at any call site.
 const CFTypeRef = ?*const anyopaque;
 const CFAllocatorRef = ?*const anyopaque;
 const CFStringRef = ?*const anyopaque;
@@ -56,8 +47,8 @@ const kCFNumberSInt64Type: CFNumberType = 4;
 const kCFNumberIntType: CFNumberType = 9;
 const kCFStringEncodingUTF8: CFStringEncoding = 0x08000100;
 
-// `extern var` rather than `extern const`: these are ordinary globals in the
-// dylib holding a pointer value, and we only ever read them.
+// `extern var`, not `const`: ordinary dylib globals holding a pointer value,
+// which we only ever read.
 extern "c" var kCFAllocatorNull: CFAllocatorRef;
 extern "c" var kCFBooleanTrue: CFTypeRef;
 extern "c" var kCGImageSourceCreateThumbnailFromImageAlways: CFStringRef;
@@ -132,9 +123,8 @@ pub const Error = error{ DecodeFailed, EncodeFailed, OutOfMemory };
 pub const Summary = struct {
     width: i64,
     height: i64,
-    /// PNG bytes, owned by the caller's allocator. Its own dimensions aren't
-    /// reported: they're in the PNG's IHDR chunk, so anything holding these
-    /// bytes can read them without us carrying a second copy around.
+    /// PNG bytes, owned by the caller's allocator. Its own dimensions go
+    /// unreported — they're in the PNG's IHDR chunk already.
     thumb: []u8,
 };
 
@@ -145,10 +135,9 @@ pub fn summarize(
     bytes: []const u8,
     max_px: u32,
 ) Error!Summary {
-    // NoCopy + kCFAllocatorNull: CF reads straight out of `bytes` and is told
-    // not to free a buffer it doesn't own. Safe because every CF object made
-    // from it is released before this returns, well inside the caller's
-    // ownership of `bytes`.
+    // NoCopy + kCFAllocatorNull: CF reads straight out of `bytes` and won't
+    // free a buffer it doesn't own. Safe because every CF object derived from
+    // it is released before this returns.
     const data = CFDataCreateWithBytesNoCopy(
         null,
         bytes.ptr,
@@ -157,13 +146,11 @@ pub fn summarize(
     ) orelse return Error.DecodeFailed;
     defer CFRelease(data);
 
-    // A CGImageSource is a lazy handle on the container — creating it parses
-    // headers only, no pixels.
     const src = CGImageSourceCreateWithData(data, null) orelse return Error.DecodeFailed;
     defer CFRelease(src);
 
-    // Dimensions come from container metadata, so an 8000x8000 screenshot
-    // costs the same here as a 16x16 icon.
+    // Metadata only, no pixels: an 8000x8000 screenshot costs what a 16x16 icon
+    // does here.
     const props = CGImageSourceCopyPropertiesAtIndex(src, 0, null) orelse
         return Error.DecodeFailed;
     defer CFRelease(props);
@@ -185,10 +172,9 @@ fn makeThumb(src: CGImageSourceRef, max_px: u32) Error!CGImageRef {
     const num = CFNumberCreate(null, kCFNumberIntType, &px) orelse return Error.DecodeFailed;
     defer CFRelease(num);
 
-    // FromImageAlways: JPEGs often carry a tiny embedded EXIF thumbnail, and
-    // without this ImageIO hands that back instead of downscaling the real
-    // image. WithTransform applies the EXIF orientation so the thumbnail isn't
-    // rotated relative to what the user actually copied.
+    // FromImageAlways: without it, ImageIO hands back a JPEG's tiny embedded
+    // EXIF thumbnail instead of downscaling the real image. WithTransform
+    // applies EXIF orientation so the result isn't rotated.
     const keys = [_]?*const anyopaque{
         kCGImageSourceCreateThumbnailFromImageAlways,
         kCGImageSourceCreateThumbnailWithTransform,
@@ -196,16 +182,14 @@ fn makeThumb(src: CGImageSourceRef, max_px: u32) Error!CGImageRef {
     };
     const vals = [_]?*const anyopaque{ kCFBooleanTrue, kCFBooleanTrue, num };
 
-    // Null callbacks = the dictionary stores raw pointers and does not
-    // retain/release its keys or values. Legal per CFDictionary, and correct
-    // here: `num` and the constants all outlive `opts`, which is released
-    // first (defers unwind in reverse).
+    // Null callbacks: the dict stores raw pointers and does NOT retain its
+    // values, so `num` must outlive it — defers unwind in reverse, so `opts`
+    // dies first.
     const opts = CFDictionaryCreate(null, &keys, &vals, keys.len, null, null) orelse
         return Error.DecodeFailed;
     defer CFRelease(opts);
 
-    // MaxPixelSize caps the *longest* side and preserves aspect ratio, so
-    // there's no target rect to compute.
+    // MaxPixelSize caps the *longest* side and preserves aspect ratio.
     return CGImageSourceCreateThumbnailAtIndex(src, 0, opts) orelse Error.DecodeFailed;
 }
 
@@ -213,9 +197,8 @@ fn encodePng(allocator: std.mem.Allocator, img: CGImageRef) Error![]u8 {
     const out = CFDataCreateMutable(null, 0) orelse return Error.EncodeFailed;
     defer CFRelease(out);
 
-    // The raw UTI string, not kUTTypePNG — that constant is deprecated in
-    // favour of the UniformTypeIdentifiers framework, which would mean linking
-    // another framework to say the same eleven characters.
+    // Raw UTI string, not kUTTypePNG: that constant is deprecated in favour of
+    // UniformTypeIdentifiers, a whole framework to link for eleven characters.
     const uti = CFStringCreateWithCString(null, "public.png", kCFStringEncodingUTF8) orelse
         return Error.EncodeFailed;
     defer CFRelease(uti);
@@ -225,18 +208,17 @@ fn encodePng(allocator: std.mem.Allocator, img: CGImageRef) Error![]u8 {
     defer CFRelease(dest);
 
     CGImageDestinationAddImage(dest, img, null);
-    // Finalize is where encoding actually happens; AddImage only queues.
+    // AddImage only queues; Finalize is where encoding happens.
     if (!CGImageDestinationFinalize(dest)) return Error.EncodeFailed;
 
-    // Borrowed pointer into the CFMutableData — must copy before the defer
-    // above releases it.
+    // Borrowed pointer into the CFMutableData — copy before the defer releases it.
     const ptr = CFDataGetBytePtr(out);
     const len: usize = @intCast(CFDataGetLength(out));
     return allocator.dupe(u8, ptr[0..len]) catch Error.OutOfMemory;
 }
 
-// CFDictionaryGetValue borrows (no release). CFNumberGetValue returns false on
-// a lossy conversion — treated as "absent", same as a missing key.
+// CFDictionaryGetValue borrows (no release). A lossy CFNumberGetValue returns
+// false, treated here as absent — same as a missing key.
 fn dictInt(dict: CFDictionaryRef, key: CFStringRef) ?i64 {
     const v = CFDictionaryGetValue(dict, key) orelse return null;
     var out: i64 = 0;

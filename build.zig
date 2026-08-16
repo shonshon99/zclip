@@ -4,10 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Run translate-c on a thin shim header that includes <sqlite3.h>.
-    // Replaces the deprecated `@cImport` block that used to live in db.zig.
-    // `createModule()` makes the result a private module visible only to
-    // this package.
+    // translate-c over a shim header that includes <sqlite3.h>; `@cImport` in
+    // source is deprecated in 0.16. Add new SQLite symbols by editing the shim.
     const sqlite_c = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite_c.h"),
         .target = target,
@@ -21,26 +19,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    // Expose the translated SQLite bindings to Zig source as
-    // `@import("sqlite_c")`.
     root_mod.addImport("sqlite_c", sqlite_c.createModule());
-    // mitchellh/zig-objc — Objective-C runtime bindings. Replaces the
-    // hand-rolled `objc_msgSend` FFI plumbing that used to live in
-    // `clipboard.zig`. Exposed to Zig source as `@import("objc")`.
     const zig_objc = b.dependency("zig_objc", .{
         .target = target,
         .optimize = optimize,
     });
     root_mod.addImport("objc", zig_objc.module("objc"));
-    // Link the actual SQLite library so the translated declarations
-    // resolve at link time. translate-c only generates *headers* — the
-    // linker still needs the .dylib.
     root_mod.linkSystemLibrary("sqlite3", .{});
     root_mod.linkFramework("Foundation", .{});
     root_mod.linkFramework("AppKit", .{});
-    // src/image.zig declares the ImageIO/CoreGraphics/CoreFoundation symbols
-    // by hand (see the header comment there for why translate-c is not used);
-    // these frameworks are what resolve them at link time.
+    // These resolve the symbols src/image.zig declares by hand.
     root_mod.linkFramework("CoreFoundation", .{});
     root_mod.linkFramework("CoreGraphics", .{});
     root_mod.linkFramework("ImageIO", .{});
