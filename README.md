@@ -40,8 +40,9 @@ zclip daemon
 
 # 2. Copy things normally (Cmd-C). The daemon records each copy.
 
-# 3. In another shell, list everything as JSON.
+# 3. In another shell, list everything as JSON — or just the newest few.
 zclip query
+zclip query --limit 20
 
 # 4. Tag an entry, filter by tag, and paste it back.
 zclip tag 42 work
@@ -74,13 +75,13 @@ so deleting it costs one re-run of `zclip thumb` and never loses data.
 ## Commands
 
 ```
-zclip daemon                  Run the polling daemon (foreground)
-zclip query [--tag <name>]    Dump entries as a JSON array (newest first)
-zclip tags                    Dump all tag names as a JSON array
-zclip use <id>                Write entry <id> back to the pasteboard
-zclip thumb <id>              Materialise image <id>'s thumbnail, print its path
-zclip tag <id> <tag>          Attach one tag to an entry
-zclip untag <id> <tag>        Remove one tag from an entry
+zclip daemon                              Run the polling daemon (foreground)
+zclip query [--tag <name>] [--limit <n>]  Dump entries as a JSON array (newest first)
+zclip tags                                Dump all tag names as a JSON array
+zclip use <id>                            Write entry <id> back to the pasteboard
+zclip thumb <id>                          Materialise image <id>'s thumbnail, print its path
+zclip tag <id> <tag>                      Attach one tag to an entry
+zclip untag <id> <tag>                    Remove one tag from an entry
 ```
 
 ### `zclip daemon`
@@ -114,16 +115,27 @@ The following copies are **never** recorded:
 - zclip's own `zclip use` writes, marked with a private `dev.zclip.origin`
   pasteboard type, so re-pasting doesn't create a feedback loop.
 
-### `zclip query [--tag <name>]`
+### `zclip query [--tag <name>] [--limit <n>]`
 
-Dumps entries as a **JSON array**, newest first (`copied_at DESC`). This is the
-single read command the external picker calls — zclip does no server-side text
-search; it returns rows and the client filters them in memory.
+Dumps entries as a **JSON array**, newest first (`copied_at DESC, id DESC`).
+This is the single read command the external picker calls — zclip does no
+server-side text search; it returns rows and the client filters them in memory.
 
 - No argument → **all** entries.
 - `--tag <name>` → only entries carrying that one tag. Single tag only; the
   value is one literal name (`--tag work,home` matches a tag literally named
   `work,home`, it is **not** split). The match is case-insensitive.
+- `--limit <n>` → at most `n` rows. Applied **after** any `--tag` filter, so
+  `--tag work --limit 5` is the five newest *work* entries, not the work
+  entries among the five newest. `n` is an unsigned 32-bit integer; `--limit 0`
+  prints `[]` and exits 0. Omit the flag for no cap.
+
+Flags may be given in either order. Repeating a flag, omitting its value, or
+giving `--limit` a negative or non-numeric argument exits 2.
+
+`id DESC` is a tiebreaker, not a sort key you should depend on for meaning: it
+only decides the order of entries sharing a `copied_at`, so that a given
+`--limit` returns the same rows on every call.
 
 Every object carries `id` and `kind` (`"text"` or `"image"`). The remaining keys
 depend on the kind, and keys that don't apply are **omitted entirely** rather
