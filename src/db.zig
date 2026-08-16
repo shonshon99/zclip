@@ -379,22 +379,43 @@ pub const Db = struct {
         " i.path, i.uti, i.width, i.height, i.byte_len" ++
         " FROM entries e LEFT JOIN images i ON i.entry_id = e.id";
 
-    pub fn getEntries(self: *Db) Error![]Entry {
-        const stmt = try self.prepare(entry_select ++ " ORDER BY e.copied_at DESC;");
+    /// All entries, newest first. A null `limit` binds -1, which SQLite reads
+    /// as unbounded — that's what lets one prepared statement serve both the
+    /// capped and uncapped call. `e.id DESC` breaks `copied_at` ties so a
+    /// given limit returns the same rows every time; it costs nothing, since
+    /// `entries_copied_at_idx` already carries the rowid as its trailing key.
+    pub fn getEntries(self: *Db, limit: ?u32) Error![]Entry {
+        const stmt = try self.prepare(
+            entry_select ++
+                " ORDER BY e.copied_at DESC, e.id DESC" ++
+                " LIMIT ?;",
+        );
         defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_int64(
+            stmt,
+            1,
+            limit orelse -1,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+
         return self.collectEntries(stmt);
     }
 
-    /// Entries carrying `tag`, newest first. No cap — the tag is the bound.
-    /// `tags.name` is COLLATE NOCASE, so the match is case-insensitive.
-    pub fn getEntriesByTag(self: *Db, tag: []const u8) Error![]Entry {
+    /// Entries carrying `tag`, newest first. Same null-limit-means-unbounded
+    /// rule as `getEntries`, but no early exit here: the tag drives the scan,
+    /// so every tagged row is fetched and sorted before the first is emitted.
+    /// The limit only bounds the sorter. `tags.name` is COLLATE NOCASE, so the
+    /// match is case-insensitive.
+    pub fn getEntriesByTag(self: *Db, tag: []const u8, limit: ?u32) Error![]Entry {
         const stmt = try self.prepare(
             entry_select ++
                 " JOIN entry_tags et ON et.entry_id = e.id" ++
                 " JOIN tags t ON t.id = et.tag_id" ++
-                " WHERE t.name = ? ORDER BY e.copied_at DESC;",
+                " WHERE t.name = ? ORDER BY e.copied_at DESC, e.id DESC" ++
+                " LIMIT ?;",
         );
         defer _ = c.sqlite3_finalize(stmt);
+
         if (c.sqlite3_bind_text(
             stmt,
             1,
@@ -402,6 +423,12 @@ pub const Db = struct {
             @intCast(tag.len),
             SQLITE_STATIC,
         ) != c.SQLITE_OK) return Error.BindFailed;
+        if (c.sqlite3_bind_int64(
+            stmt,
+            2,
+            limit orelse -1,
+        ) != c.SQLITE_OK) return Error.BindFailed;
+
         return self.collectEntries(stmt);
     }
 
